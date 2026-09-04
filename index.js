@@ -315,6 +315,199 @@ async function handleOrderWebhook(status, metadata) {
   }
 }
 
+// ---------------------------
+// Verifie le token Firebase envoye par le client (header Authorization:
+// Bearer <idToken>). Renvoie le uid decode, ou lance si absent/invalide.
+// ---------------------------
+async function requireAuth(req) {
+  const header = req.get('Authorization') || '';
+  const idToken = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!idToken) {
+    const err = new Error('missing auth token');
+    err.statusCode = 401;
+    throw err;
+  }
+  try {
+    return await admin.auth().verifyIdToken(idToken);
+  } catch (e) {
+    const err = new Error('invalid auth token');
+    err.statusCode = 401;
+    throw err;
+  }
+}
+
+// ---------------------------
+// Confirmation manuelle d'un paiement -- repli cote app quand l'utilisateur
+// revient dans l'app avant que le webhook Genius Pay n'ait eu le temps
+// d'arriver (voir /transaction/verify/:reference plus haut, qui ne fait
+// qu'AFFICHER le statut sans jamais rien ecrire). Reutilise exactement la
+// meme logique que le webhook (handleOrderWebhook/handleSubscriptionWebhook),
+// simplement declenchee par le client plutot que par Genius Pay -- protegee
+// par une verification d'identite Firebase + un controle de propriete du
+// paiement, pour qu'un utilisateur ne puisse jamais confirmer le paiement de
+// quelqu'un d'autre. Le statut confirme reste celui reellement renvoye par
+// Genius Pay (fetchGeniusPayTransaction), jamais celui envoye par le client.
+//
+// Audit du 2026-09-05 : avant ce endpoint, l'app mobile ecrivait elle-meme
+// paymentStatus/isSubscribed directement dans Firestore apres avoir appele
+// /transaction/verify -- rien n'empechait un client de sauter cette
+// verification et d'ecrire directement un statut "paye" bidon.
+app.post('/transaction/confirm/:reference', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+
+    const result = await fetchGeniusPayTransaction(req.params.reference);
+    const txData = result.data || result;
+    const status = txData.status;
+    const metadata = txData.metadata || {};
+
+    if (metadata.paymentKind === 'subscription') {
+      if (metadata.userId !== decoded.uid) {
+        return res.status(403).json({ error: 'not your payment' });
+      }
+      if (!db) return res.status(503).json({ error: 'firestore not configured' });
+      await handleSubscriptionWebhook(status, metadata);
+    } else if (metadata.paymentKind === 'order') {
+      if (metadata.buyerId !== decoded.uid) {
+        return res.status(403).json({ error: 'not your payment' });
+      }
+      if (!db) return res.status(503).json({ error: 'firestore not configured' });
+      await handleOrderWebhook(status, metadata);
+    } else {
+      return res.status(400).json({ error: 'unknown paymentKind in metadata' });
+    }
+
+    res.json({ status });
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+// ---------------------------
+// Liberation du sequestre par code PIN -- avant ce endpoint, le client
+// (escrow_service.dart) ecrivait directement escrow.status/orders.escrowStatus
+// dans Firestore, et la regle Firestore permettait a n'importe quelle partie
+// du sequestre (acheteur inclus) de le faire sans jamais entrer le bon PIN ni
+// meme avoir paye (audit du 2026-09-05). Le PIN et l'etat de paiement sont
+// desormais verifies ici, cote serveur, avant toute ecriture.
+// ---------------------------
+app.post('/escrow/release', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const { orderId, pin } = req.body || {};
+    if (!orderId || !pin) {
+      return res.status(400).json({ error: 'orderId and pin required' });
+    }
+
+    const orderRef = db.collection('orders').doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      return res.status(404).json({ error: 'order not found' });
+    }
+    const order = orderSnap.data();
+
+    const uid = decoded.uid;
+    const isAuthorized =
+      order.sellerId === uid ||
+      order.assignedDriverId === uid ||
+      order.livreurId === uid ||
+      order.driverId === uid;
+    if (!isAuthorized) {
+      return res.status(403).json({ error: 'not authorized for this order' });
+    }
+
+    if (order.escrowStatus !== 'in_escrow') {
+      return res.status(409).json({ error: 'order not in escrow' });
+    }
+
+    const paidStatuses = ['pay_on_delivery', 'test_mode_paid', 'completed'];
+    if (!paidStatuses.includes(order.paymentStatus)) {
+      return res.status(409).json({ error: 'payment not confirmed' });
+    }
+
+    if (!order.customerPin || order.customerPin !== pin) {
+      return res.json({ success: false });
+    }
+
+    const escrowId = order.escrowId;
+    if (!escrowId) {
+      return res.status(409).json({ error: 'escrow not found for this order' });
+    }
+
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const batch = db.batch();
+    batch.update(db.collection('escrow').doc(escrowId), {
+      status: 'released',
+      pinValidatedAt: now,
+      releasedAt: now,
+    });
+    batch.update(orderRef, {
+      escrowStatus: 'released',
+      status: 'delivered',
+      deliveryStatus: 'delivered',
+      escrowReleasedAt: now,
+      lastUpdated: now,
+    });
+    await batch.commit();
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+// ---------------------------
+// Octroi gratuit en mode test -- PAYMENTS_DISABLED est ici une variable
+// d'environnement DU SERVEUR (Render), pas du client : contrairement au flag
+// cote app (lib/services/payment_config.dart, extrait facilement d'un APK),
+// celle-ci ne peut pas etre falsifiee par le client. Sans ce endpoint, une
+// commande/un abonnement cree en mode test restait bloque a
+// 'awaiting_checkout' pour toujours, puisque le client ne peut plus ecrire
+// paymentStatus lui-meme (regles Firestore, audit du 2026-09-05).
+// ---------------------------
+app.post('/payment/grant-test-mode', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    if (process.env.PAYMENTS_DISABLED !== 'true') {
+      return res.status(403).json({ error: 'test mode not enabled on server' });
+    }
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const body = req.body || {};
+    const paymentKind = body.paymentKind;
+
+    if (paymentKind === 'subscription') {
+      const { userId, planName, days, subscriptionPaymentId } = body;
+      if (userId !== decoded.uid) {
+        return res.status(403).json({ error: 'not your payment' });
+      }
+      await handleSubscriptionWebhook('completed', {
+        userId,
+        planName,
+        days,
+        subscriptionPaymentId,
+      });
+    } else if (paymentKind === 'order') {
+      const { orderId, buyerId, sellerId } = body;
+      if (buyerId !== decoded.uid) {
+        return res.status(403).json({ error: 'not your payment' });
+      }
+      await handleOrderWebhook('completed', { orderId, buyerId, sellerId });
+    } else {
+      return res.status(400).json({ error: 'unknown paymentKind' });
+    }
+
+    res.json({ status: 'completed' });
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('W‑Com Genius Pay backend is running');
 });

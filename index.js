@@ -522,6 +522,51 @@ app.post('/transaction/confirm/:reference', async (req, res) => {
 });
 
 // ---------------------------
+// Confirmation gratuite d'une campagne 'whatsapp' -- ce canal n'a aucun
+// envoi automatise reel (aucun compte WhatsApp Business API/Meta configure
+// dans ce projet) : facturer le budget affiche pour un canal qui ne
+// delivre rien serait trompeur, donc il reste gratuit tant qu'aucune vraie
+// integration n'existe (decision produit du 2026-09-06). Le canal est
+// RE-VERIFIE ici a partir du document Firestore reel, jamais depuis une
+// valeur envoyee par le client -- un vendeur ne peut donc pas se faire
+// accorder gratuitement une campagne 'inapp'/'push' en pretendant qu'elle
+// est 'whatsapp'.
+// ---------------------------
+app.post('/campaign/confirm-free', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const { campaignId } = req.body || {};
+    if (!campaignId) {
+      return res.status(400).json({ error: 'campaignId required' });
+    }
+
+    const campaignRef = db.collection('campaigns').doc(campaignId);
+    const campaignSnap = await campaignRef.get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'campaign not found' });
+    }
+    const campaign = campaignSnap.data();
+
+    if (campaign.channel !== 'whatsapp') {
+      return res.status(403).json({ error: 'only whatsapp campaigns are free' });
+    }
+
+    const storeSnap = await db.collection('stores').doc(campaign.storeId).get();
+    if (!storeSnap.exists || storeSnap.data().ownerId !== decoded.uid) {
+      return res.status(403).json({ error: 'not your campaign' });
+    }
+
+    await handleCampaignWebhook('completed', { campaignId });
+    res.json({ status: 'completed' });
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+// ---------------------------
 // Liberation du sequestre par code PIN -- avant ce endpoint, le client
 // (escrow_service.dart) ecrivait directement escrow.status/orders.escrowStatus
 // dans Firestore, et la regle Firestore permettait a n'importe quelle partie

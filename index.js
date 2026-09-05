@@ -177,6 +177,11 @@ app.get('/transaction/verify/:reference', async (req, res) => {
 // webhook. `metadata.paymentKind` distingue :
 //   - 'subscription' (payment_screen.dart)  -> userId, planName, days,
 //     subscriptionPaymentId
+//   - 'driver_subscription' (livreur_subscription_screen.dart) -> userId,
+//     days, subscriptionPaymentId (même schéma que 'subscription', mais
+//     écrit sur public_drivers/{userId} au lieu de users/{userId} -- un
+//     compte peut être vendeur ET livreur en même temps, les deux
+//     abonnements doivent rester indépendants)
 //   - 'order' (checkout_screen.dart)        -> orderId, buyerId, sellerId
 // ---------------------------
 function isSignatureValid(req) {
@@ -227,6 +232,8 @@ app.post('/webhook/genius-pay', async (req, res) => {
 
     if (metadata.paymentKind === 'subscription') {
       await handleSubscriptionWebhook(status, metadata);
+    } else if (metadata.paymentKind === 'driver_subscription') {
+      await handleDriverSubscriptionWebhook(status, metadata);
     } else if (metadata.paymentKind === 'order') {
       await handleOrderWebhook(status, metadata);
     } else if (metadata.paymentKind === 'campaign') {
@@ -279,6 +286,46 @@ async function handleSubscriptionWebhook(status, metadata) {
   }
 
   console.log(`✅ Abonnement confirmé pour ${userId} (${planName})`);
+}
+
+// Miroir de handleSubscriptionWebhook pour l'abonnement livreur (2 500
+// FCFA/mois, livreur_subscription_screen.dart) -- même logique, mais écrit
+// sur public_drivers/{userId} (subscriptionActive/subscriptionExpiresAt) au
+// lieu de users/{userId} (isSubscribed/currentPlan), et n'active aucune
+// boutique. Sans ce handler, firestore.rules::public_drivers empêche le
+// client d'écrire ces champs lui-même (audit du 2026-09-04, même faille que
+// users/{userId}.isSubscribed) : le paiement resterait indéfiniment à
+// 'awaiting_checkout'.
+async function handleDriverSubscriptionWebhook(status, metadata) {
+  const { userId, days, subscriptionPaymentId } = metadata;
+  if (!userId) {
+    console.error('❌ Webhook abonnement livreur sans userId dans metadata');
+    return;
+  }
+
+  if (subscriptionPaymentId) {
+    await db
+      .collection('subscriptionPayments')
+      .doc(subscriptionPaymentId)
+      .update({
+        paymentStatus: status === 'completed' ? 'completed' : status,
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      })
+      .catch((e) => console.error('subscriptionPayments update failed:', e.message));
+  }
+
+  if (status !== 'completed') {
+    console.log(`ℹ️ Paiement abonnement livreur ${userId} : statut ${status}, aucun changement d'accès`);
+    return;
+  }
+
+  const expiryDate = new Date(Date.now() + Number(days || 30) * 24 * 60 * 60 * 1000);
+  await db.collection('public_drivers').doc(userId).update({
+    subscriptionActive: true,
+    subscriptionExpiresAt: admin.firestore.Timestamp.fromDate(expiryDate),
+  });
+
+  console.log(`✅ Abonnement livreur confirmé pour ${userId}`);
 }
 
 async function handleOrderWebhook(status, metadata) {
@@ -498,6 +545,12 @@ app.post('/transaction/confirm/:reference', async (req, res) => {
       }
       if (!db) return res.status(503).json({ error: 'firestore not configured' });
       await handleSubscriptionWebhook(status, metadata);
+    } else if (metadata.paymentKind === 'driver_subscription') {
+      if (metadata.userId !== decoded.uid) {
+        return res.status(403).json({ error: 'not your payment' });
+      }
+      if (!db) return res.status(503).json({ error: 'firestore not configured' });
+      await handleDriverSubscriptionWebhook(status, metadata);
     } else if (metadata.paymentKind === 'order') {
       if (metadata.buyerId !== decoded.uid) {
         return res.status(403).json({ error: 'not your payment' });
@@ -670,6 +723,16 @@ app.post('/payment/grant-test-mode', async (req, res) => {
       await handleSubscriptionWebhook('completed', {
         userId,
         planName,
+        days,
+        subscriptionPaymentId,
+      });
+    } else if (paymentKind === 'driver_subscription') {
+      const { userId, days, subscriptionPaymentId } = body;
+      if (userId !== decoded.uid) {
+        return res.status(403).json({ error: 'not your payment' });
+      }
+      await handleDriverSubscriptionWebhook('completed', {
+        userId,
         days,
         subscriptionPaymentId,
       });

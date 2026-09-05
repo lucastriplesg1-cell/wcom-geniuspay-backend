@@ -201,6 +201,8 @@ app.post('/webhook/genius-pay', async (req, res) => {
       await handleSubscriptionWebhook(status, metadata);
     } else if (metadata.paymentKind === 'order') {
       await handleOrderWebhook(status, metadata);
+    } else if (metadata.paymentKind === 'campaign') {
+      await handleCampaignWebhook(status, metadata);
     } else {
       console.warn('⚠️ Webhook Genius Pay avec metadata.paymentKind inconnu:', metadata);
     }
@@ -315,6 +317,82 @@ async function handleOrderWebhook(status, metadata) {
   }
 }
 
+// Confirme le paiement d'une campagne marketing (create_campaign_screen.dart)
+// et, pour les campagnes "In-App", pose la mise en avant sur les produits de
+// la boutique -- cote serveur uniquement (Admin SDK, contourne les regles
+// Firestore, qui interdisent desormais au vendeur d'ecrire lui-meme
+// campaigns.status/paymentStatus ou products.featuredCampaignId/
+// featuredPriority/featuredUntil). Avant ce webhook, ces champs etaient
+// figes sur 'pending_payment' pour toujours (aucun paiement jamais debite),
+// et la mise en avant etait appliquee IMMEDIATEMENT et GRATUITEMENT a la
+// creation de la campagne, sans jamais lire la mise en avant nulle part
+// cote acheteur -- fonctionnalite inerte des deux cotes (audit du
+// 2026-09-02, corrige le 2026-09-05 une fois shop_screen.dart mis a jour
+// pour trier reellement dessus).
+async function handleCampaignWebhook(status, metadata) {
+  const { campaignId } = metadata;
+  if (!campaignId) {
+    console.error('❌ Webhook campagne sans campaignId dans metadata');
+    return;
+  }
+
+  const campaignRef = db.collection('campaigns').doc(campaignId);
+  const campaignSnap = await campaignRef.get();
+  if (!campaignSnap.exists) {
+    console.error(`❌ Webhook campagne introuvable: ${campaignId}`);
+    return;
+  }
+  const campaign = campaignSnap.data();
+
+  if (status === 'completed') {
+    // 'En cours' (et non 'active') pour matcher le statut deja attendu par
+    // l'affichage existant dans marketing_screen.dart (rawStatus == 'En cours').
+    await campaignRef.update({
+      status: 'En cours',
+      paymentStatus: 'completed',
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    if (campaign.channel === 'inapp') {
+      const duration = Number(campaign.duration) || 7;
+      // Priorite proportionnelle au budget quotidien -- une campagne plus
+      // genereuse ou plus courte doit ressortir davantage qu'une campagne
+      // au budget etale sur une longue duree.
+      const priority = Math.round((Number(campaign.budget) || 0) / duration);
+      const until = admin.firestore.Timestamp.fromMillis(
+        Date.now() + duration * 24 * 60 * 60 * 1000
+      );
+
+      const productsSnap = await db
+        .collection('products')
+        .where('storeId', '==', campaign.storeId)
+        .get();
+      if (!productsSnap.empty) {
+        const batch = db.batch();
+        productsSnap.docs.forEach((doc) => {
+          batch.update(doc.ref, {
+            featuredCampaignId: campaignId,
+            featuredPriority: priority,
+            featuredUntil: until,
+          });
+        });
+        await batch.commit();
+      }
+    }
+
+    console.log(`✅ Campagne ${campaignId} confirmee payee`);
+  } else if (['failed', 'cancelled', 'expired'].includes(status)) {
+    await campaignRef.update({
+      status: 'checkout_failed',
+      paymentStatus: 'checkout_failed',
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`ℹ️ Campagne ${campaignId} : paiement ${status}`);
+  } else {
+    console.log(`ℹ️ Campagne ${campaignId} : statut intermediaire ${status}`);
+  }
+}
+
 // ---------------------------
 // Verifie le token Firebase envoye par le client (header Authorization:
 // Bearer <idToken>). Renvoie le uid decode, ou lance si absent/invalide.
@@ -373,6 +451,12 @@ app.post('/transaction/confirm/:reference', async (req, res) => {
       }
       if (!db) return res.status(503).json({ error: 'firestore not configured' });
       await handleOrderWebhook(status, metadata);
+    } else if (metadata.paymentKind === 'campaign') {
+      if (metadata.ownerId !== decoded.uid) {
+        return res.status(403).json({ error: 'not your payment' });
+      }
+      if (!db) return res.status(503).json({ error: 'firestore not configured' });
+      await handleCampaignWebhook(status, metadata);
     } else {
       return res.status(400).json({ error: 'unknown paymentKind in metadata' });
     }
@@ -497,6 +581,12 @@ app.post('/payment/grant-test-mode', async (req, res) => {
         return res.status(403).json({ error: 'not your payment' });
       }
       await handleOrderWebhook('completed', { orderId, buyerId, sellerId });
+    } else if (paymentKind === 'campaign') {
+      const { campaignId, ownerId } = body;
+      if (ownerId !== decoded.uid) {
+        return res.status(403).json({ error: 'not your payment' });
+      }
+      await handleCampaignWebhook('completed', { campaignId, ownerId });
     } else {
       return res.status(400).json({ error: 'unknown paymentKind' });
     }

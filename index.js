@@ -107,6 +107,34 @@ async function notifySellerPush(sellerId, title, message, data) {
   }
 }
 
+// Meme mecanisme que notifySellerPush, mais pour une LISTE de destinataires
+// (les acheteurs abonnes a une boutique, cf. handleCampaignWebhook) --
+// OneSignal accepte un tableau external_id, un seul appel suffit donc quel
+// que soit le nombre d'abonnes.
+async function notifyBuyersPush(buyerIds, title, message, data) {
+  const restApiKey = process.env.ONESIGNAL_REST_API_KEY;
+  if (!restApiKey || !buyerIds || buyerIds.length === 0) return;
+  try {
+    await fetch('https://onesignal.com/api/v1/notifications', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Authorization': `Basic ${restApiKey}`,
+      },
+      body: JSON.stringify({
+        app_id: ONESIGNAL_APP_ID,
+        target_channel: 'push',
+        include_aliases: { external_id: buyerIds },
+        headings: { en: title, fr: title },
+        contents: { en: message, fr: message },
+        data: { type: 'store_update', updateType: 'campaign', ...data },
+      }),
+    });
+  } catch (e) {
+    console.error('⚠️ Push OneSignal (campagne) échoué:', e.message);
+  }
+}
+
 // ---------------------------
 // Public endpoint for your app
 // ---------------------------
@@ -377,6 +405,31 @@ async function handleCampaignWebhook(status, metadata) {
           });
         });
         await batch.commit();
+      }
+    } else if (campaign.channel === 'push') {
+      // Envoie reellement la campagne "push" aux acheteurs abonnes a cette
+      // boutique (store_subscriptions) -- avant ce webhook, une campagne
+      // 'push' etait creee/facturee mais rien ne l'envoyait jamais nulle
+      // part (audit du 2026-09-06). Le texte utilise est celui choisi/genere
+      // par le vendeur a la creation (campaign.aiText), avec un repli
+      // generique s'il ne l'a pas rempli.
+      const subsSnap = await db
+        .collection('store_subscriptions')
+        .where('storeId', '==', campaign.storeId)
+        .get();
+      const buyerIds = subsSnap.docs
+        .map((doc) => doc.data().buyerId)
+        .filter((id) => typeof id === 'string' && id.length > 0);
+
+      if (buyerIds.length > 0) {
+        const message =
+          campaign.aiText && campaign.aiText.trim().length > 0
+            ? campaign.aiText
+            : `${campaign.name} : decouvrez nos offres !`;
+        await notifyBuyersPush(buyerIds, campaign.name || 'Nouvelle offre', message, {
+          storeId: campaign.storeId,
+          campaignId,
+        });
       }
     }
 

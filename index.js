@@ -789,6 +789,103 @@ app.post('/payment/grant-test-mode', async (req, res) => {
   }
 });
 
+// ---------------------------
+// Demande de retrait -- recalcule le solde reellement disponible cote
+// serveur (Admin SDK) avant d'ecrire quoi que ce soit dans withdrawals
+// (signale par l'utilisateur 2026-09-05) : portefeuille_screen.dart
+// ecrivait auparavant directement dans Firestore, et la regle ne
+// verifiait que l'identite du vendeur, jamais que le montant demande
+// correspondait a un solde reel -- n'importe quel client pouvait donc
+// demander un retrait pour un montant arbitraire. Reprend exactement la
+// meme logique de calcul que portefeuille_screen.dart (statuts payes,
+// escrowReleasedAt, delai de 24h) pour ne jamais rejeter un retrait
+// legitime que l'ecran affiche pourtant comme disponible.
+// ---------------------------
+const PAID_ORDER_STATUSES = new Set(['pay_on_delivery', 'test_mode_paid', 'completed']);
+
+async function computeAvailableBalance(sellerId) {
+  const [ordersSnap, withdrawalsSnap] = await Promise.all([
+    db.collection('orders').where('sellerId', '==', sellerId).get(),
+    db.collection('withdrawals').where('sellerId', '==', sellerId).get(),
+  ]);
+
+  const now = new Date();
+  let availableBalance = 0;
+
+  ordersSnap.forEach((doc) => {
+    const data = doc.data();
+    const amount = Number(data.sellerAmount ?? data.totalAmount ?? 0);
+    const status = data.status || 'pending';
+    const paymentStatus = data.paymentStatus;
+    const escrowStatus = (data.escrowStatus || 'none').toString();
+
+    if (
+      (status === 'delivered' || status === 'shipped') &&
+      !PAID_ORDER_STATUSES.has(paymentStatus)
+    ) {
+      return;
+    }
+    if (status !== 'delivered' || escrowStatus === 'in_escrow') {
+      return;
+    }
+
+    const releaseDate =
+      (data.escrowReleasedAt && data.escrowReleasedAt.toDate && data.escrowReleasedAt.toDate()) ||
+      (data.timestamp && data.timestamp.toDate && data.timestamp.toDate());
+    if (releaseDate && (now - releaseDate) / 3600000 >= 24) {
+      availableBalance += amount;
+    }
+  });
+
+  let totalWithdrawn = 0;
+  withdrawalsSnap.forEach((doc) => {
+    const data = doc.data();
+    const amount = Number(data.amount || 0);
+    const status = data.status || 'pending';
+    if (status === 'completed' || status === 'pending') {
+      totalWithdrawn += amount;
+    }
+  });
+
+  return availableBalance - totalWithdrawn;
+}
+
+app.post('/withdrawal/request', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const { amount, method, accountNumber } = req.body || {};
+    const requestedAmount = Number(amount);
+    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) {
+      return res.status(400).json({ error: 'invalid amount' });
+    }
+
+    const sellerId = decoded.uid;
+    const availableBalance = await computeAvailableBalance(sellerId);
+
+    if (requestedAmount > availableBalance) {
+      return res
+        .status(409)
+        .json({ error: 'amount exceeds available balance', availableBalance });
+    }
+
+    const ref = await db.collection('withdrawals').add({
+      sellerId,
+      amount: requestedAmount,
+      status: 'pending',
+      method: method || null,
+      accountNumber: accountNumber || null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ success: true, withdrawalId: ref.id });
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('W‑Com Genius Pay backend is running');
 });

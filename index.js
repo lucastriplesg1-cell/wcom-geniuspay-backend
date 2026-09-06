@@ -898,6 +898,105 @@ app.post('/withdrawal/request', async (req, res) => {
   }
 });
 
+// ---------------------------
+// Conseils IA du tableau de bord Statistiques -- avant, statistics_screen.dart
+// appelait directement l'API NVIDIA depuis le client avec la cle
+// NVIDIA_API_KEY embarquee dans le .env de l'app (donc extractible d'un APK),
+// permettant a n'importe qui de consommer/facturer le quota NVIDIA du compte
+// W-Com sans jamais passer par l'app (audit du 2026-09-05). Le prompt et
+// l'appel NVIDIA sont desormais construits ici, la cle ne quitte plus le
+// serveur ; le client envoie uniquement les metriques deja calculees
+// localement (rien de sensible) et recoit le tableau d'insights deja parse.
+// ---------------------------
+app.post('/ai/insights', async (req, res) => {
+  try {
+    await requireAuth(req);
+
+    const {
+      grossRevenue,
+      orderCount,
+      storeRating,
+      fidelity,
+      totalItemsSold,
+      topCategoryName,
+      topCategoryCount,
+      acquisition,
+      outputLanguage,
+    } = req.body || {};
+
+    const lang = ['anglais', 'espagnol'].includes(outputLanguage)
+      ? outputLanguage
+      : 'français';
+    const avgOrder = orderCount ? Number(grossRevenue) / Number(orderCount) : 0;
+
+    const systemPrompt = `Tu es un conseiller commercial expert pour les vendeurs sur W-Com (une plateforme e-commerce africaine). Tu dois analyser les données du vendeur et donner 3 à 5 conseils concrets, pratiques et personnalisés.
+
+Règles de formatage obligatoires :
+- Réponds **uniquement** en JSON, pas de texte en dehors
+- Le JSON doit être un tableau d'objets avec ces champs :
+  - "title" (chaîne de caractères, court, en ${lang})
+  - "desc" (chaîne de caractères, 1 à 2 phrases max, en ${lang})
+  - "color" (chaîne de caractères : "orange", "cyan", "yellow", "green", "purple", "red")
+  - "icon" (chaîne de caractères, nom d'icône Material Icons : lightbulb, warning, map, shopping_cart, star, attach_money, etc.)
+
+Exemple de réponse valide :
+[
+  {"title": "Augmentez votre panier moyen", "desc": "Votre panier moyen est bas. Proposez des packs produits.", "color": "cyan", "icon": "shopping_cart"},
+  {"title": "Fidélisez vos clients", "desc": "Votre taux de fidélité est faible. Créez un programme de récompenses.", "color": "orange", "icon": "favorite"}
+]`;
+
+    const userPrompt = `Voici les données du vendeur :
+- Chiffre d'affaires total (période sélectionnée) : ${Number(grossRevenue || 0).toFixed(0)} FCFA
+- Nombre de commandes : ${Number(orderCount || 0)}
+- Panier moyen : ${avgOrder.toFixed(0)} FCFA
+- Note moyenne de la boutique : ${storeRating || 0}/5
+- Taux de fidélité (clients qui ont acheté plusieurs fois) : ${Number(fidelity || 0).toFixed(0)}%
+- Nombre d'articles vendus : ${Number(totalItemsSold || 0)}
+- Catégorie la plus vendue : ${topCategoryName || ''} (${Number(topCategoryCount || 0)} articles)
+- Nombre de clients acquis (normalisé) : ${Number(acquisition || 0).toFixed(0)}%
+
+Donne 3 à 5 conseils personnalisés pour améliorer les ventes.`;
+
+    const nvidiaResponse = await fetch(
+      'https://integrate.api.nvidia.com/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: 'meta/llama-3.2-90b-vision-instruct',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          max_tokens: 800,
+          temperature: 0.7,
+        }),
+      }
+    );
+
+    if (!nvidiaResponse.ok) {
+      return res.status(502).json({ error: 'ai upstream error' });
+    }
+
+    const responseData = await nvidiaResponse.json();
+    const replyText = (responseData.choices?.[0]?.message?.content || '').trim();
+    const jsonStart = replyText.indexOf('[');
+    const jsonEnd = replyText.lastIndexOf(']') + 1;
+    if (jsonStart === -1 || jsonEnd <= jsonStart) {
+      return res.status(502).json({ error: 'invalid ai response' });
+    }
+
+    const insights = JSON.parse(replyText.substring(jsonStart, jsonEnd));
+    res.json({ insights });
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('W‑Com Genius Pay backend is running');
 });

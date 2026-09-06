@@ -24,6 +24,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "firebase-admin": "^13.0.2",
+    "node-cron": "^4.6.0",
     "node-fetch": "^3.3.2"
   }
 }

@@ -4,6 +4,7 @@ require('dotenv').config();          // loads .env locally (development only)
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const cron = require('node-cron');
 const admin = require('firebase-admin');
 
 const app = express();
@@ -790,6 +791,122 @@ app.post('/payment/grant-test-mode', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.send('W‑Com Genius Pay backend is running');
+});
+
+// ---------------------------
+// Tache planifiee (toutes les 5 minutes) -- reevalue automatiquement deux
+// champs que plus rien cote client ne remettait jamais a jour dans le temps
+// (signale par l'utilisateur 2026-09-05) :
+// - isShopOpen (horaires d'ouverture, settings_screen.dart) : n'etait
+//   recalcule qu'au moment ou le vendeur sauvegardait un reglage, jamais
+//   ensuite -- une boutique "ouverte 9h-18h" restait "ouverte" pour
+//   toujours passe 18h tant que personne ne retouchait aux reglages.
+// - isActive (abonnement) : rien ne desactivait jamais une boutique dont
+//   l'abonnement a reellement expire (resilie puis expire, ou simplement
+//   jamais renouvele) -- elle restait achetable indefiniment cote
+//   acheteurs alors que le vendeur a deja perdu l'acces a son dashboard
+//   (seller_dashboard.dart bloque deja l'ACCES vendeur via subscriptionDate,
+//   mais ne touche jamais au document stores).
+//
+// Hypothese assumee : le serveur tourne en UTC, qui correspond a l'heure
+// d'Abidjan (GMT, pas de changement d'heure) -- coherent avec le reste de
+// l'app, deja centree sur la Cote d'Ivoire (communes d'Abidjan en dur dans
+// checkout_screen.dart). A revoir si l'app s'etend a un fuseau different.
+// ---------------------------
+
+// Meme logique exacte que settings_screen.dart::_updateStoreStatusBasedOnTime
+// (client), reprise ici cote serveur pour etre reevaluee dans le temps sans
+// dependre d'une action du vendeur.
+function isWithinBusinessHours(tm, now) {
+  // Dart DateTime.weekday : 1=lundi ... 7=dimanche. JS Date.getDay() :
+  // 0=dimanche ... 6=samedi -- conversion pour matcher selectedDays, deja
+  // stocke cote client avec la convention Dart.
+  const currentDay = now.getDay() === 0 ? 7 : now.getDay();
+  const selectedDays = Array.isArray(tm.selectedDays)
+    ? tm.selectedDays
+    : [1, 2, 3, 4, 5];
+  if (!selectedDays.includes(currentDay)) return false;
+
+  const toMinutes = (value, fallbackH, fallbackM) => {
+    const parts = (value || '').split(':');
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    return (Number.isNaN(h) ? fallbackH : h) * 60 + (Number.isNaN(m) ? fallbackM : m);
+  };
+
+  const currentMinutes = now.getHours() * 60 + now.getMinutes();
+  const startMinutes = toMinutes(tm.businessStart, 9, 0);
+  const endMinutes = toMinutes(tm.businessEnd, 18, 0);
+  let isOpen = currentMinutes >= startMinutes && currentMinutes < endMinutes;
+
+  if (isOpen && tm.breakPeriodEnabled) {
+    const breakStart = toMinutes(tm.breakStart, 12, 0);
+    const breakEnd = toMinutes(tm.breakEnd, 13, 0);
+    if (currentMinutes >= breakStart && currentMinutes < breakEnd) {
+      isOpen = false;
+    }
+  }
+
+  return isOpen;
+}
+
+async function reconcileBusinessHours() {
+  if (!db) return;
+  try {
+    const usersSnap = await db
+      .collection('users')
+      .where('timeManagement.businessHoursEnabled', '==', true)
+      .get();
+
+    const now = new Date();
+    for (const userDoc of usersSnap.docs) {
+      const tm = userDoc.data().timeManagement || {};
+      const storesSnap = await db
+        .collection('stores')
+        .where('ownerId', '==', userDoc.id)
+        .limit(1)
+        .get();
+      if (storesSnap.empty) continue;
+
+      const storeDoc = storesSnap.docs[0];
+      const isOpen = isWithinBusinessHours(tm, now);
+      if (storeDoc.data().isShopOpen !== isOpen) {
+        await storeDoc.ref.update({ isShopOpen: isOpen });
+      }
+    }
+  } catch (e) {
+    console.error('❌ reconcileBusinessHours:', e.message);
+  }
+}
+
+async function reconcileSubscriptionExpiry() {
+  if (!db) return;
+  try {
+    const storesSnap = await db
+      .collection('stores')
+      .where('isActive', '==', true)
+      .get();
+
+    const now = new Date();
+    for (const storeDoc of storesSnap.docs) {
+      const ownerId = storeDoc.data().ownerId;
+      if (!ownerId) continue;
+      const userSnap = await db.collection('users').doc(ownerId).get();
+      const subscriptionDate = userSnap.data()?.subscriptionDate;
+      const expired = !subscriptionDate || subscriptionDate.toDate() < now;
+      if (expired) {
+        await storeDoc.ref.update({ isActive: false });
+        console.log(`ℹ️ Boutique ${storeDoc.id} désactivée (abonnement expiré)`);
+      }
+    }
+  } catch (e) {
+    console.error('❌ reconcileSubscriptionExpiry:', e.message);
+  }
+}
+
+cron.schedule('*/5 * * * *', () => {
+  reconcileBusinessHours();
+  reconcileSubscriptionExpiry();
 });
 
 app.listen(PORT, () => {

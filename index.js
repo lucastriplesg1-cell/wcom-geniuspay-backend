@@ -645,11 +645,32 @@ app.post('/escrow/release', async (req, res) => {
     const order = orderSnap.data();
 
     const uid = decoded.uid;
-    const isAuthorized =
+    let isAuthorized =
       order.sellerId === uid ||
-      order.assignedDriverId === uid ||
       order.livreurId === uid ||
       order.driverId === uid;
+
+    // BUG (signale par l'utilisateur 2026-09-05, corrige) : order.assignedDriverId
+    // est l'ID du document delivery_drivers (l'entree de flotte cote vendeur,
+    // cree via .add() dans le client), jamais egal a l'UID Firebase Auth reel
+    // du livreur -- cette comparaison directe ne pouvait donc jamais passer
+    // pour le livreur, qui se voyait rejete en permanence ("PIN incorrect")
+    // meme avec le bon code, l'obligeant a demander au vendeur de valider a
+    // sa place. On resout le vrai UID via le champ userId du document
+    // delivery_drivers correspondant (present pour un livreur "public",
+    // absent pour un livreur ajoute manuellement -- qui n'a de toute facon
+    // pas de compte pour appeler ce endpoint).
+    if (!isAuthorized && order.assignedDriverId) {
+      const fleetEntrySnap = await db
+        .collection('delivery_drivers')
+        .doc(order.assignedDriverId)
+        .get();
+      const fleetEntryUserId = fleetEntrySnap.exists
+        ? fleetEntrySnap.data().userId
+        : null;
+      isAuthorized = fleetEntryUserId === uid;
+    }
+
     if (!isAuthorized) {
       return res.status(403).json({ error: 'not authorized for this order' });
     }

@@ -804,9 +804,10 @@ app.post('/payment/grant-test-mode', async (req, res) => {
 const PAID_ORDER_STATUSES = new Set(['pay_on_delivery', 'test_mode_paid', 'completed']);
 
 async function computeAvailableBalance(sellerId) {
-  const [ordersSnap, withdrawalsSnap] = await Promise.all([
+  const [ordersSnap, withdrawalsSnap, vaultsSnap] = await Promise.all([
     db.collection('orders').where('sellerId', '==', sellerId).get(),
     db.collection('withdrawals').where('sellerId', '==', sellerId).get(),
+    db.collection('vaults').where('sellerId', '==', sellerId).get(),
   ]);
 
   const now = new Date();
@@ -847,7 +848,18 @@ async function computeAvailableBalance(sellerId) {
     }
   });
 
-  return availableBalance - totalWithdrawn;
+  // Les tirelires reservent reellement une partie du solde (audit du
+  // 2026-09-05) : avant, une tirelire creditee par l'auto-epargne
+  // (VaultService.processAutoSave, cote client) ne deduisait jamais rien
+  // ici -- le vendeur pouvait donc retirer 100% d'une vente en plus de ce
+  // que l'app lui affichait comme "mis de cote" dans sa tirelire, le meme
+  // argent etant compte deux fois.
+  let totalInVaults = 0;
+  vaultsSnap.forEach((doc) => {
+    totalInVaults += Number(doc.data().currentAmount || 0);
+  });
+
+  return availableBalance - totalWithdrawn - totalInVaults;
 }
 
 app.post('/withdrawal/request', async (req, res) => {

@@ -344,8 +344,16 @@ async function handleOrderWebhook(status, metadata) {
   const orderData = orderSnap.data();
 
   if (status === 'completed') {
+    // BUG (signale par l'utilisateur 2026-09-05, corrige) : seul paymentStatus
+    // passait a 'completed' ici -- orders.status restait bloque sur
+    // 'awaiting_payment' (sa valeur de creation) jusqu'a ce que le vendeur
+    // clique manuellement "Expedier" ou que le PIN de livraison soit valide.
+    // Une commande reellement payee s'affichait donc indefiniment comme "en
+    // attente de paiement" cote vendeur. 'pending' est le statut suivant
+    // attendu par le client (orders_screen.dart::_statusLabel).
     await orderRef.update({
       paymentStatus: 'completed',
+      status: 'pending',
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
     });
 

@@ -1057,6 +1057,54 @@ app.post('/ai/chat', async (req, res) => {
   }
 });
 
+// ---------------------------
+// Proxy generique vers OneSignal (envoi de notifications push) -- avant,
+// ONESIGNAL_REST_API_KEY etait embarquee dans le .env de l'app et appelee
+// directement depuis au moins 10 fichiers client (chat, avis produits,
+// reactivation clients, abonnements boutique, vente eclair, Workspace...),
+// extractible d'un APK (audit du 2026-09-06). Cette cle permet d'envoyer une
+// notification a n'importe quel segment/utilisateur OneSignal de l'app --
+// bien plus grave qu'une simple cle IA : extraite, elle aurait permis de
+// spammer/phisher l'integralite des utilisateurs de l'app, pas seulement de
+// consommer un quota. app_id force cote serveur (non secret, deja en dur
+// cote client, mais autant rester la seule source de verite). Le reste du
+// payload (cible, titre, contenu, son, data) est transmis tel quel : chaque
+// appelant construit deja ce payload lui-meme, rien dedans n'est sensible.
+// Authentification Firebase requise -- n'empeche pas un utilisateur connecte
+// de cibler un segment plus large que prevu (ex: 'Subscribed Users' au lieu
+// des seuls abonnes de sa boutique, deja le comportement existant de
+// flash_sale_screen.dart avant ce correctif), mais ferme l'exposition totale
+// et anonyme de la cle qui permettait de le faire sans meme avoir de compte.
+// ---------------------------
+app.post('/notifications/push', async (req, res) => {
+  try {
+    await requireAuth(req);
+    if (!process.env.ONESIGNAL_REST_API_KEY) {
+      return res.status(503).json({ error: 'onesignal not configured' });
+    }
+
+    const payload = { ...(req.body || {}), app_id: ONESIGNAL_APP_ID };
+
+    const oneSignalResponse = await fetch(
+      'https://onesignal.com/api/v1/notifications',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          Authorization: `Basic ${process.env.ONESIGNAL_REST_API_KEY}`,
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    const data = await oneSignalResponse.json().catch(() => ({}));
+    res.status(oneSignalResponse.status).json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('W‑Com Genius Pay backend is running');
 });

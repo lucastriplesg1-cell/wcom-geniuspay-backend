@@ -997,6 +997,66 @@ Donne 3 à 5 conseils personnalisés pour améliorer les ventes.`;
   }
 });
 
+// ---------------------------
+// Proxy generique vers NVIDIA (chat/completions) -- meme faille que
+// /ai/insights ci-dessus mais pour les autres fonctionnalites IA de l'app
+// (chat Repos, generation de legendes, description produit, resume de
+// conversation Workspace...) qui appelaient toutes NVIDIA directement
+// depuis le client avec la cle embarquee (NVIDIA_API_KEY et/ou
+// NVIDIA_VISION_API_KEY selon l'ecran, audit du 2026-09-06). Le client
+// garde la construction de ses prompts (logique produit, pas sensible) ;
+// seule la cle ne quitte plus jamais le serveur. Authentification Firebase
+// requise (comme /ai/insights) -- n'empeche pas un utilisateur connecte
+// d'utiliser un peu plus de quota que prevu, mais ferme l'exposition
+// totale et anonyme de la cle. model restreint aux deux modeles reellement
+// utilises par l'app, max_tokens plafonne, pour eviter qu'un appel
+// detourne (mauvais modele, max_tokens enorme) ne coute plus que prevu.
+// ---------------------------
+const ALLOWED_AI_MODELS = new Set([
+  'meta/llama-3.2-90b-vision-instruct',
+  'meta/llama-3.2-11b-vision-instruct',
+]);
+
+app.post('/ai/chat', async (req, res) => {
+  try {
+    await requireAuth(req);
+
+    const { model, messages, max_tokens, temperature, top_p } = req.body || {};
+    if (!ALLOWED_AI_MODELS.has(model)) {
+      return res.status(400).json({ error: 'unsupported model' });
+    }
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages required' });
+    }
+
+    const cappedMaxTokens = Math.min(Number(max_tokens) || 500, 1000);
+
+    const nvidiaResponse = await fetch(
+      'https://integrate.api.nvidia.com/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          max_tokens: cappedMaxTokens,
+          ...(temperature !== undefined ? { temperature } : {}),
+          ...(top_p !== undefined ? { top_p } : {}),
+        }),
+      }
+    );
+
+    const data = await nvidiaResponse.json();
+    res.status(nvidiaResponse.status).json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('W‑Com Genius Pay backend is running');
 });

@@ -270,7 +270,24 @@ async function handleSubscriptionWebhook(status, metadata) {
     return;
   }
 
-  const expiryDate = new Date(Date.now() + Number(days || 30) * 24 * 60 * 60 * 1000);
+  // Renouvellement anticipé : si l'abonnement en cours n'est pas encore
+  // expiré, les nouveaux jours s'ajoutent à sa date d'expiration au lieu de
+  // repartir de maintenant -- sinon un vendeur qui renouvelle quelques jours
+  // avant l'échéance perdait les jours restants déjà payés (signalé
+  // 2026-09-08, KPI Abonnement).
+  const now = Date.now();
+  let baseTime = now;
+  try {
+    const userSnap = await db.collection('users').doc(userId).get();
+    const existingExpiry = userSnap.data()?.subscriptionDate;
+    if (existingExpiry && existingExpiry.toDate().getTime() > now) {
+      baseTime = existingExpiry.toDate().getTime();
+    }
+  } catch (e) {
+    console.error('Lecture subscriptionDate existante échouée, base = maintenant:', e.message);
+  }
+
+  const expiryDate = new Date(baseTime + Number(days || 30) * 24 * 60 * 60 * 1000);
   await db.collection('users').doc(userId).update({
     isSubscribed: true,
     currentPlan: planName,
@@ -286,7 +303,7 @@ async function handleSubscriptionWebhook(status, metadata) {
     await storesSnap.docs[0].ref.update({ isActive: true });
   }
 
-  console.log(`✅ Abonnement confirmé pour ${userId} (${planName})`);
+  console.log(`✅ Abonnement confirmé pour ${userId} (${planName}), expire le ${expiryDate.toISOString()}`);
 }
 
 // Miroir de handleSubscriptionWebhook pour l'abonnement livreur (2 500
@@ -320,13 +337,28 @@ async function handleDriverSubscriptionWebhook(status, metadata) {
     return;
   }
 
-  const expiryDate = new Date(Date.now() + Number(days || 30) * 24 * 60 * 60 * 1000);
+  // Même correctif que handleSubscriptionWebhook ci-dessus (2026-09-08) :
+  // cumule sur la date d'expiration existante si elle n'est pas encore
+  // passée, au lieu d'écraser les jours restants déjà payés.
+  const now = Date.now();
+  let baseTime = now;
+  try {
+    const driverSnap = await db.collection('public_drivers').doc(userId).get();
+    const existingExpiry = driverSnap.data()?.subscriptionExpiresAt;
+    if (existingExpiry && existingExpiry.toDate().getTime() > now) {
+      baseTime = existingExpiry.toDate().getTime();
+    }
+  } catch (e) {
+    console.error('Lecture subscriptionExpiresAt existante échouée, base = maintenant:', e.message);
+  }
+
+  const expiryDate = new Date(baseTime + Number(days || 30) * 24 * 60 * 60 * 1000);
   await db.collection('public_drivers').doc(userId).update({
     subscriptionActive: true,
     subscriptionExpiresAt: admin.firestore.Timestamp.fromDate(expiryDate),
   });
 
-  console.log(`✅ Abonnement livreur confirmé pour ${userId}`);
+  console.log(`✅ Abonnement livreur confirmé pour ${userId}, expire le ${expiryDate.toISOString()}`);
 }
 
 async function handleOrderWebhook(status, metadata) {

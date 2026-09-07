@@ -1252,9 +1252,91 @@ async function reconcileSubscriptionExpiry() {
   }
 }
 
+// Petit relais interne vers l'API OneSignal, sans repasser par l'endpoint
+// HTTP /notifications/push (evite un aller-retour reseau vers soi-meme) --
+// meme cle/app_id que cet endpoint, jamais exposes au client.
+async function sendOneSignalPush(payload) {
+  if (!process.env.ONESIGNAL_REST_API_KEY) return;
+  try {
+    await fetch('https://onesignal.com/api/v1/notifications', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        Authorization: `Basic ${process.env.ONESIGNAL_REST_API_KEY}`,
+      },
+      body: JSON.stringify({ ...payload, app_id: ONESIGNAL_APP_ID }),
+    });
+  } catch (e) {
+    console.error('sendOneSignalPush failed:', e.message);
+  }
+}
+
+// Rappel de fin d'abonnement (demande utilisateur 2026-09-08) : previent le
+// vendeur 7 jours avant l'echeance, pour lui laisser le temps de se
+// reabonner avant la coupure d'acces (voir reconcileSubscriptionExpiry
+// ci-dessus, qui desactive la boutique des l'expiration reelle). Un seul
+// rappel par cycle d'abonnement : subscriptionReminderForExpiryMs memorise
+// pour QUELLE date d'expiration le rappel a deja ete envoye, et se
+// desynchronise naturellement des qu'un renouvellement change cette date
+// (le prochain cycle redeclenche donc son propre rappel sans etat a
+// reinitialiser manuellement).
+async function reconcileSubscriptionReminders() {
+  if (!db) return;
+  try {
+    const now = new Date();
+    const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const usersSnap = await db
+      .collection('users')
+      .where('subscriptionDate', '>', now)
+      .where('subscriptionDate', '<=', sevenDaysFromNow)
+      .get();
+
+    for (const userDoc of usersSnap.docs) {
+      const data = userDoc.data();
+      const expiry = data.subscriptionDate.toDate();
+      const expiryMs = expiry.getTime();
+      if (data.subscriptionReminderForExpiryMs === expiryMs) continue;
+
+      const daysRemaining = Math.max(
+        1,
+        Math.ceil((expiryMs - now.getTime()) / (24 * 60 * 60 * 1000))
+      );
+      const planName = data.currentPlan || 'votre forfait';
+      const title = '⏳ Votre abonnement expire bientôt';
+      const message = `Il vous reste ${daysRemaining} jour${daysRemaining > 1 ? 's' : ''} avant la fin de votre abonnement ${planName}. Renouvelez dès maintenant pour ne pas perdre l'accès à votre boutique.`;
+
+      await db.collection('notifications').add({
+        receiverId: userDoc.id,
+        title,
+        message,
+        type: 'subscription_reminder',
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        isRead: false,
+      });
+
+      await sendOneSignalPush({
+        include_aliases: { external_id: [userDoc.id] },
+        target_channel: 'push',
+        headings: { en: 'Your subscription is about to expire', fr: title },
+        contents: {
+          en: `You have ${daysRemaining} day(s) left. Renew now to keep your store online.`,
+          fr: message,
+        },
+        data: { type: 'subscription_reminder' },
+      });
+
+      await userDoc.ref.update({ subscriptionReminderForExpiryMs: expiryMs });
+      console.log(`🔔 Rappel abonnement envoyé à ${userDoc.id} (${daysRemaining}j restants)`);
+    }
+  } catch (e) {
+    console.error('❌ reconcileSubscriptionReminders:', e.message);
+  }
+}
+
 cron.schedule('*/5 * * * *', () => {
   reconcileBusinessHours();
   reconcileSubscriptionExpiry();
+  reconcileSubscriptionReminders();
 });
 
 app.listen(PORT, () => {

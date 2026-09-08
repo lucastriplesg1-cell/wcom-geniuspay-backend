@@ -1,0 +1,25 @@
+name: Keep Render backend awake
+
+# Le plan Render gratuit met le service en veille après ~15 min d'inactivité --
+# le réveil prend 30 à 90s, ce qui faisait échouer silencieusement les
+# notifications push (sendPushNotification, appelé sans timeout ni retry)
+# déclenchées pendant cette fenêtre (signalé par l'utilisateur 2026-09-08 :
+# "on ne reçoit plus de notification pour plusieurs actions"). Ce ping évite
+# que le service ne s'endorme, sans dépendre d'une visite utilisateur.
+on:
+  schedule:
+    # Toutes les 10 minutes -- marge de sécurité sous le seuil de veille de
+    # Render (~15 min). GitHub retarde parfois légèrement les cron
+    # schedules ; 10 min laisse assez de marge pour rester fiable.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend root endpoint
+        run: |
+          curl -sf --max-time 100 https://wcom-geniuspay-backend.onrender.com/ \
+            && echo "Backend awake" \
+            || echo "Ping failed (backend may have been cold-starting) -- not fatal"

@@ -717,6 +717,14 @@ app.post('/escrow/release', async (req, res) => {
     }
 
     if (order.escrowStatus !== 'in_escrow') {
+      // Idempotence : si la commande est déjà marquée livrée ou l'escrow déjà libéré,
+      // et que le PIN concorde (ou si le PIN avait déjà été validé), on retourne
+      // un succès immédiat pour éviter l'erreur 409 lors d'une nouvelle tentative.
+      if (order.escrowStatus === 'released' || order.status === 'delivered') {
+        if (!order.customerPin || order.customerPin === pin) {
+          return res.json({ success: true, alreadyReleased: true });
+        }
+      }
       return res.status(409).json({ error: 'order not in escrow' });
     }
 

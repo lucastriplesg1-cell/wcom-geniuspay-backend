@@ -1057,19 +1057,958 @@ const ALLOWED_AI_MODELS = new Set([
   'meta/llama-3.2-11b-vision-instruct',
 ]);
 
-app.post('/ai/chat', async (req, res) => {
+const reposRateLimits = new Map();
+
+// ==========================================
+// PHASE 1F.10.3 : REPOS ASSISTANT ENDPOINT
+// ==========================================
+app.post('/ai/repos-assistant', async (req, res) => {
   try {
-    await requireAuth(req);
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
 
-    const { model, messages, max_tokens, temperature, top_p } = req.body || {};
-    if (!ALLOWED_AI_MODELS.has(model)) {
-      return res.status(400).json({ error: 'unsupported model' });
+    const now = Date.now();
+    const userLimit = reposRateLimits.get(uid) || { count: 0, windowStart: now };
+    if (now - userLimit.windowStart > 60000) {
+      userLimit.count = 1;
+      userLimit.windowStart = now;
+    } else {
+      userLimit.count++;
+      if (userLimit.count > 15) {
+        return res.status(429).json({
+          error: 'rate_limit_exceeded',
+          message: 'Too many AI requests. Please try again later.'
+        });
+      }
     }
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return res.status(400).json({ error: 'messages required' });
+    reposRateLimits.set(uid, userLimit);
+
+    const { storeId, message, history, image, language = 'French' } = req.body || {};
+    if (!storeId || typeof storeId !== 'string') return res.status(400).json({ error: 'storeId required' });
+    if (!message || typeof message !== 'string') return res.status(400).json({ error: 'message required' });
+    
+    let safeHistory = [];
+    if (Array.isArray(history)) {
+      safeHistory = history
+        .filter(h => h.role === 'user' || h.role === 'assistant')
+        .slice(-8); // keep last 8
     }
 
-    const cappedMaxTokens = Math.min(Number(max_tokens) || 500, 1000);
+    const storeSnap = await db.collection('stores').doc(storeId).get();
+    if (!storeSnap.exists) {
+      return res.status(403).json({ error: 'store not found' });
+    }
+    const storeData = storeSnap.data();
+    if (storeData.ownerId !== uid) {
+      return res.status(403).json({ error: 'access denied' });
+    }
+
+    const jsNow = new Date();
+    const thirtyDaysAgoDate = new Date(jsNow);
+    thirtyDaysAgoDate.setDate(jsNow.getDate() - 30);
+    
+    const sixtyDaysAgoDate = new Date(jsNow);
+    sixtyDaysAgoDate.setDate(jsNow.getDate() - 60);
+
+    const yesterdayDate = new Date(jsNow);
+    yesterdayDate.setDate(jsNow.getDate() - 1);
+
+    const [ordersSnap, productsSnap, reviewsSnap, driversSnap, driversBySellerSnap] = await Promise.all([
+      db.collection('orders').where('sellerId', '==', uid).get(),
+      db.collection('products').where('storeId', '==', storeId).get(),
+      db.collection('product_reviews').where('storeId', '==', storeId).limit(5).get(),
+      db.collection('delivery_drivers').where('storeId', '==', storeId).get(),
+      db.collection('delivery_drivers').where('sellerId', '==', uid).get()
+    ]);
+
+    let totalRevenue = 0;
+    let totalOrders = 0;
+    let yesterdayRevenue = 0;
+    let urgentOrders = 0;
+    const productStats = {}; 
+    const salesLast30DaysByName = {};
+    const lastPurchaseMap = {};
+
+    const ordersSortedDesc = [...ordersSnap.docs].sort((a,b) => {
+      const ta = (a.data().timestamp?.toDate() || new Date(0)).getTime();
+      const tb = (b.data().timestamp?.toDate() || new Date(0)).getTime();
+      return tb - ta;
+    });
+    const recentOrdersDocs = ordersSortedDesc.slice(0, 10);
+
+    for (const doc of ordersSnap.docs) {
+      const data = doc.data();
+      const ts = data.timestamp ? data.timestamp.toDate() : null;
+      const buyerId = data.buyerId;
+
+      if (buyerId && ts) {
+        if (!lastPurchaseMap[buyerId] || ts > lastPurchaseMap[buyerId]) {
+          lastPurchaseMap[buyerId] = ts;
+        }
+      }
+
+      if (ts && ts > thirtyDaysAgoDate) {
+        totalOrders++;
+        totalRevenue += Number(data.totalAmount) || 0.0;
+
+        const items = data.items || [];
+        for (const item of items) {
+          const name = item.name || 'Inconnu';
+          const qty = Number(item.quantity) || 1;
+          const price = Number(item.price) || 0.0;
+
+          if (!productStats[name]) productStats[name] = { sales: 0, revenue: 0.0 };
+          productStats[name].sales += qty;
+          productStats[name].revenue += (price * qty);
+
+          salesLast30DaysByName[name] = (salesLast30DaysByName[name] || 0) + qty;
+        }
+      }
+
+      if (ts && ts.getFullYear() === yesterdayDate.getFullYear() && ts.getMonth() === yesterdayDate.getMonth() && ts.getDate() === yesterdayDate.getDate()) {
+        yesterdayRevenue += Number(data.totalAmount) || 0.0;
+      }
+      if (data.status === 'pending') {
+        urgentOrders++;
+      }
+    }
+
+    let inactiveClientsCount = 0;
+    for (const buyerId in lastPurchaseMap) {
+      if (lastPurchaseMap[buyerId] < sixtyDaysAgoDate) {
+        inactiveClientsCount++;
+      }
+    }
+
+    const detailedProducts = [];
+    const stockAlerts = [];
+    const smartPricing = [];
+
+    for (const doc of productsSnap.docs) {
+      const data = doc.data();
+      const name = data.name || 'Sans nom';
+      const price = Number(data.price) || 0.0;
+      const stock = Number(data.quantity) || 0;
+      const createdAt = data.createdAt ? data.createdAt.toDate() : null;
+      const salesLast30Days = salesLast30DaysByName[name] || 0;
+
+      const stats = productStats[name] || { sales: 0, revenue: 0.0 };
+      detailedProducts.push({
+        id: doc.id,
+        nom: name,
+        prix: price,
+        stock_actuel: stock,
+        ventes_30j: stats.sales,
+        ca_30j: stats.revenue,
+      });
+
+      const velocity = salesLast30Days / 30;
+      if (velocity > 0) {
+        const daysRemaining = Math.floor(stock / velocity);
+        if (daysRemaining <= 5) {
+          stockAlerts.push({
+            productName: name,
+            daysRemaining,
+            stock,
+            velocity: velocity.toFixed(1)
+          });
+        }
+      }
+
+      if (salesLast30Days === 0) {
+        if (createdAt && (jsNow.getTime() - createdAt.getTime()) / (1000 * 3600 * 24) > 30) {
+          smartPricing.push({
+            productId: doc.id,
+            productName: name,
+            reason: 'Stock dormant (aucune vente depuis 30 jours)',
+            suggestion: 'Créer une promotion ciblée (-15%)'
+          });
+        }
+      } else if (salesLast30Days >= 10) {
+        smartPricing.push({
+          productId: doc.id,
+          productName: name,
+          reason: `Produit très demandé (${salesLast30Days} ventes ces 30 derniers jours)`,
+          suggestion: 'Augmenter légèrement le prix (+5%)'
+        });
+      }
+    }
+
+    const recentReviews = reviewsSnap.docs.map(doc => `- ${doc.data().rating}/5: ${doc.data().comment || 'Pas de commentaire'}`).join("\n") || "Aucun avis";
+    
+    const recentOrders = recentOrdersDocs.map(doc => {
+      const data = doc.data();
+      return `- Commande ID=${doc.id}, Client=${data.customerName || 'Inconnu'}, Total=${Number(data.totalAmount)||0} CFA, Statut=${data.status||'pending'}, Livreur=${data.livreurName||'Non assigné'}`;
+    }).join("\n");
+
+    const actualDrivers = driversSnap.empty ? driversBySellerSnap.docs : driversSnap.docs;
+    const availableDrivers = actualDrivers.map(doc => {
+      const data = doc.data();
+      return `- ${data.name || 'Inconnu'} : ID=${doc.id}, Statut=${data.driverStatus || 'disponible'}, Zones=${data.coverageCommunes || []}`;
+    }).join("\n");
+
+    const storeContext = `CONTEXTE BOUTIQUE :
+- Nom : ${storeData.storeName || 'Ma Boutique'}
+- Catégorie : ${storeData.category || 'Général'}
+- Ville : ${storeData.commune || 'Non spécifiée'}
+- Note : ${Number(storeData.averageRating)||0}/5 (${Number(storeData.reviewCount)||0} avis)
+
+PERFORMANCES GLOBALES (30 JOURS) :
+- CA Total : ${totalRevenue.toFixed(0)} CFA
+- Commandes : ${totalOrders}
+
+CATALOGUE DÉTAILLÉ (Prix, Stocks et Ventes) :
+${detailedProducts.map(p => `- ${p.nom} : ID=${p.id}, Prix=${p.prix} CFA, Stock=${p.stock_actuel}, Ventes=${p.ventes_30j}, CA=${p.ca_30j} CFA`).join("\n")}
+
+COMMANDES RÉCENTES (10 dernières) :
+${recentOrders}
+
+LISTE DES LIVREURS :
+${availableDrivers}
+
+AVIS RÉCENTS :
+${recentReviews}`;
+
+    const insightsText = JSON.stringify({
+      stockAlerts,
+      smartPricing,
+      dailyBriefing: { yesterdayRevenue, urgentOrders },
+      inactiveClientsCount
+    });
+
+    let systemPrompt = "";
+    if (language === "English") {
+      systemPrompt = `You are Repos, the proactive autonomous e-commerce assistant of W-COM.
+[STORE DATA]
+${storeContext}
+[SMART INSIGHTS (JSON)]
+${insightsText}
+YOUR NEW AUTONOMOUS CAPABILITIES:
+1. Stock Forecasting: Analyze 'stockAlerts' to prevent stockouts.
+2. Smart Pricing: Use 'smartPricing' to suggest targeted promotions on dormant stocks or suggest increasing prices slightly for high-demand products.
+3. Briefing: Use 'dailyBriefing' to summarize performance.
+4. Marketing Campaign: Analyze 'inactiveClientsCount'. If > 0, proactively propose to send a push/in-app campaign.
+5. EDIT ACTIONS (VERY IMPORTANT):
+   Use the special format [ACTION:TYPE:ID:VALUE] in your reply to trigger execution:
+   - Price: [ACTION:UPDATE_PRICE:productId:new_price]
+   - Stock: [ACTION:UPDATE_STOCK:productId:new_stock]
+   - Description: [ACTION:UPDATE_DESC:productId:new_description]
+   - Order Status: [ACTION:UPDATE_ORDER_STATUS:orderId:new_status]
+   - Assign Driver: [ACTION:ASSIGN_DRIVER:orderId:driverId:driverName]
+   - Send Campaign: [ACTION:SEND_CAMPAIGN:discount:promoCode]
+RULES:
+- Be PROACTIVE. Mention alerts without being asked.
+- Always reply in English.`;
+    } else if (language === "Español") {
+      systemPrompt = `Eres Repos, el asistente de comercio electrónico autónomo y proactivo de W-COM.
+[DATOS DE TIENDA]
+${storeContext}
+[INFORMACIÓN INTELIGENTE (JSON)]
+${insightsText}
+TUS NUEVAS CAPACIDADES AUTÓNOMAS:
+1. Previsión de stock: Analiza 'stockAlerts' para prevenir la falta de stock.
+2. Smart Pricing: Utiliza 'smartPricing' para sugerir promociones dirigidas en inventario inactivo o sugerir aumentar los precios ligeramente.
+3. Briefing: Utiliza 'dailyBriefing' para resumir el rendimiento.
+4. Campaña de Marketing: Analiza 'inactiveClientsCount'. Si > 0, propone proactivamente enviar una campaña.
+5. ACCIONES DE EDICIÓN (MUY IMPORTANTE):
+   Utiliza el formato especial [ACTION:TYPE:ID:VALUE] en tu respuesta para activar la ejecución:
+   - Precio: [ACTION:UPDATE_PRICE:productId:nuevo_precio]
+   - Stock: [ACTION:UPDATE_STOCK:productId:nuevo_stock]
+   - Descripción: [ACTION:UPDATE_DESC:productId:nueva_descripcion]
+   - Estado del pedido: [ACTION:UPDATE_ORDER_STATUS:orderId:nuevo_estado]
+   - Asignar repartidor: [ACTION:ASSIGN_DRIVER:orderId:driverId:nombreRepartidor]
+   - Enviar campaña: [ACTION:SEND_CAMPAIGN:descuento:códigoPromo]
+REGLAS:
+- Sé PROACTIVO. Si ves una alerta, menciónala.
+- Responde siempre en Español.`;
+    } else {
+      systemPrompt = `Tu es Repos, l'assistant e-commerce autonome et proactif de W-COM.
+[DONNÉES BOUTIQUE]
+${storeContext}
+[INSIGHTS INTELLIGENTS (JSON)]
+${insightsText}
+TES NOUVELLES CAPACITÉS AUTONOMES :
+1. Prévision de stock : Analyse 'stockAlerts' pour prévenir des ruptures.
+2. Smart Pricing : Utilise 'smartPricing' pour suggérer de créer des promotions sur les stocks dormants ou d'augmenter le prix.
+3. Briefing : Utilise 'dailyBriefing'.
+4. Campagne Marketing : Analyse 'inactiveClientsCount'. Si > 0, propose d'envoyer une campagne.
+5. ACTIONS DE MODIFICATION (TRÈS IMPORTANT) :
+   Utilise le format [ACTION:TYPE:ID:VALEUR] dans ta réponse :
+   - Prix : [ACTION:UPDATE_PRICE:productId:nouveau_prix]
+   - Stock : [ACTION:UPDATE_STOCK:productId:nouveau_stock]
+   - Description : [ACTION:UPDATE_DESC:productId:nouvelle_description]
+   - Statut Commande : [ACTION:UPDATE_ORDER_STATUS:orderId:nouveau_statut]
+   - Assigner Livreur : [ACTION:ASSIGN_DRIVER:orderId:driverId:nomLivreur]
+   - Envoyer Campagne : [ACTION:SEND_CAMPAIGN:remise:codePromo]
+RÈGLES :
+- Sois PROACTIF.
+- Réponds toujours en Français.`;
+    }
+
+    const messagesForApi = [
+      { role: "system", content: systemPrompt },
+      ...safeHistory
+    ];
+
+    if (image && typeof image === 'string' && image.length < 5000000) {
+       messagesForApi.push({
+         role: "user",
+         content: [
+           { type: "text", text: (language === "English" ? "Here is the image to analyze:" : "Voici l'image à analyser :") },
+           { type: "image_url", image_url: { url: image.startsWith("data:") ? image : `data:image/jpeg;base64,${image}` } }
+         ]
+       });
+    }
+
+    messagesForApi.push({ role: "user", content: message });
+
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), 60000);
+
+    const nvidiaResponse = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
+      },
+      signal: abortController.signal,
+      body: JSON.stringify({
+        model: 'meta/llama-3.2-90b-vision-instruct',
+        messages: messagesForApi,
+        max_tokens: 500,
+        temperature: 0.6,
+        top_p: 0.9,
+      }),
+    });
+    
+    clearTimeout(timeout);
+
+    if (!nvidiaResponse.ok) {
+      const errorText = await nvidiaResponse.text();
+      throw new Error(`NVIDIA API Error: ${nvidiaResponse.status} ${errorText}`);
+    }
+
+    const data = await nvidiaResponse.json();
+    const replyText = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : '';
+
+    res.status(200).json({ text: replyText });
+
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      return res.status(504).json({ error: 'NVIDIA API timeout' });
+    }
+    console.error('/ai/repos-assistant error:', e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+// PHASE 1G.2.2 : SUMMARIZE CHAT ENDPOINT
+// ==========================================
+// PHASE 1G.3.2 : PRODUCT CONTENT ENDPOINT
+// ==========================================
+const productContentRateLimits = new Map();
+
+app.post('/ai/product-content', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
+
+    const now = Date.now();
+    const userLimit = productContentRateLimits.get(uid) || { count: 0, windowStart: now };
+    if (now - userLimit.windowStart > 60000) {
+      userLimit.count = 1;
+      userLimit.windowStart = now;
+    } else {
+      userLimit.count++;
+      if (userLimit.count > 15) {
+        return res.status(429).json({
+          error: 'rate_limit_exceeded',
+          message: 'Too many AI requests. Please try again later.'
+        });
+      }
+    }
+    productContentRateLimits.set(uid, userLimit);
+
+    let { operation, language, productDetails, taggedProductIds } = req.body || {};
+
+    const ALLOWED_OPERATIONS = new Set(['description', 'lookbook']);
+    if (!operation || !ALLOWED_OPERATIONS.has(operation)) {
+      return res.status(400).json({ error: 'invalid operation' });
+    }
+
+    const ALLOWED_LANGUAGES = new Set(['French', 'English', 'Español']);
+    if (language == null) {
+      language = 'French';
+    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'Espa\u00f1ol' && !language.startsWith('Espa')) {
+      return res.status(400).json({ error: 'invalid language' });
+    }
+    if (language && language.startsWith('Espa')) language = 'Español';
+
+    let systemPrompt = "";
+    let userPrompt = "";
+    let maxTokens = 150;
+    let temperature = 0.7;
+
+    if (operation === 'description') {
+      if (!productDetails || typeof productDetails !== 'object') {
+        return res.status(400).json({ error: 'productDetails required for description' });
+      }
+
+      const { name, category, price, stock } = productDetails;
+      if (!name || typeof name !== 'string' || name.trim().length === 0) {
+        return res.status(400).json({ error: 'invalid product name' });
+      }
+      if (!category || typeof category !== 'string' || category.trim().length === 0) {
+        return res.status(400).json({ error: 'invalid category' });
+      }
+      
+      const safeName = name.trim().substring(0, 200);
+      const safeCategory = category.trim().substring(0, 100);
+      const safePrice = String(price || '').substring(0, 50);
+      const safeStock = String(stock || '').substring(0, 50);
+
+      if (language === 'English') {
+        systemPrompt = "You are an e-commerce assistant who writes precise, natural and useful product descriptions.";
+        userPrompt = `Write a compelling product description in English for an Ivorian marketplace.\nProduct: ${safeName}\nCategory: ${safeCategory}\nPrice: ${safePrice}\nStock: ${safeStock || 'unspecified'}\nConstraints: 70 to 110 words, professional and warm tone, no emojis, no impossible promises, end with a short call to action.`;
+      } else if (language === 'Español') {
+        systemPrompt = "Eres un asistente de comercio electrónico que escribe descripciones de productos precisas, naturales y útiles.";
+        userPrompt = `Redacta una descripción de producto atractiva en español para un mercado marfileño.\nProducto: ${safeName}\nCategoría: ${safeCategory}\nPrecio: ${safePrice}\nStock: ${safeStock || 'no especificado'}\nRestricciones: 70 a 110 palabras, tono profesional y cálido, sin emojis, sin promesas imposibles, termina con una llamada a la acción corta.`;
+      } else {
+        systemPrompt = "Tu es un assistant e-commerce qui écrit des descriptions produit précises, naturelles et utiles.";
+        userPrompt = `Rédige une description produit vendeuse en français pour une marketplace ivoirienne.\nProduit: ${safeName}\nCatégorie: ${safeCategory}\nPrix: ${safePrice}\nStock: ${safeStock || 'non précisé'}\nContraintes: 70 à 110 mots, ton professionnel et chaleureux, pas d'emojis, pas de promesses impossibles, termine par un appel à l'action court.`;
+      }
+      
+      maxTokens = 220;
+      temperature = 0.7;
+
+    } else if (operation === 'lookbook') {
+      if (!Array.isArray(taggedProductIds) || taggedProductIds.length === 0) {
+        return res.status(400).json({ error: 'taggedProductIds array required for lookbook' });
+      }
+      if (taggedProductIds.length > 50) {
+        return res.status(400).json({ error: 'too many tagged products' });
+      }
+
+      if (!db) {
+        return res.status(503).json({ error: 'firestore not configured' });
+      }
+
+      // Chunk reads if necessary, but usually under 10 items. Firestore IN allows max 30.
+      const idsToFetch = taggedProductIds.slice(0, 30).filter(id => typeof id === 'string' && id.trim().length > 0);
+      
+      if (idsToFetch.length === 0) {
+        return res.status(400).json({ error: 'no valid product ids provided' });
+      }
+
+      const productsSnap = await db.collection('products')
+        .where(admin.firestore.FieldPath.documentId(), 'in', idsToFetch)
+        .get();
+
+      if (productsSnap.empty) {
+        return res.status(404).json({ error: 'no products found' });
+      }
+
+      // VERIFICATION: Check ownership of the store(s) for the retrieved products
+      const storeIds = new Set();
+      const productDocs = productsSnap.docs;
+      for (const pDoc of productDocs) {
+        const storeId = pDoc.data().storeId;
+        if (storeId) storeIds.add(storeId);
+      }
+
+      for (const storeId of storeIds) {
+        const storeSnap = await db.collection('stores').doc(storeId).get();
+        if (!storeSnap.exists || storeSnap.data().ownerId !== uid) {
+          return res.status(403).json({ error: 'access denied to one or more products' });
+        }
+      }
+
+      const noDescText = language === 'English' ? 'No description' : (language === 'Español' ? 'Sin descripción' : 'Pas de description');
+      const productsInfoList = productDocs.map(doc => {
+        const p = doc.data();
+        const priceCfa = p.price != null ? `${p.price} CFA` : '';
+        const desc = p.description ? p.description : noDescText;
+        return `- ${p.name || 'Produit'} (${priceCfa}) : ${desc}`;
+      }).join('\n');
+
+      if (language === 'English') {
+        systemPrompt = "You are a renowned e-commerce literary writer (named Repos) specialized in storytelling for fashion and craft collections.";
+        userPrompt = `Write a captivating and immersive narrative story in English to present these products in a Lookbook / Fashion-Beauty-Style Editorial.\nProducts:\n${productsInfoList}\n\nConstraints:\n- Length: 150 to 250 words.\n- Immersive and poetic tone, like a creator's blog or a Wattpad chapter.\n- No emojis, weave in beautiful metaphors around these pieces.\n- Make clear paragraphs separated by line breaks.`;
+      } else if (language === 'Español') {
+        systemPrompt = "Eres un reconocido escritor literario de comercio electrónico (llamado Repos) especializado en storytelling de colecciones de moda y artesanía.";
+        userPrompt = `Redacta una historia narrativa cautivadora e inmersiva en español para presentar estos productos en un Lookbook / Editorial de moda/belleza/estilo.\nProductos:\n${productsInfoList}\n\nRestricciones:\n- Longitud: 150 a 250 palabras.\n- Tono inmersivo y poético, tipo blog de creador o capítulo de Wattpad.\n- Sin emojis, incorpora hermosas metáforas alrededor de estas piezas.\n- Haz párrafos claros separados por saltos de línea.`;
+      } else {
+        systemPrompt = "Tu es un rédacteur littéraire e-commerce de renom (nommé Repos) spécialisé dans le storytelling de collections de mode et d'artisanat.";
+        userPrompt = `Rédige une histoire narrative captivante et immersive en français pour présenter ces produits dans un Lookbook / Éditorial de mode/beauté/style.\nProduits :\n${productsInfoList}\n\nContraintes :\n- Longueur: 150 à 250 mots.\n- Ton immersif et poétique, type blog de créateur ou chapitre Wattpad.\n- Pas d'emojis, intègre de magnifiques métaphores autour de ces pièces.\n- Fais des paragraphes clairs espacés par des sauts de ligne.`;
+      }
+
+      maxTokens = 500;
+      temperature = 0.75;
+    }
+
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), 60000);
+
+    const nvidiaResponse = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
+      },
+      signal: abortController.signal,
+      body: JSON.stringify({
+        model: 'meta/llama-3.2-11b-vision-instruct',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        max_tokens: maxTokens,
+        temperature: temperature,
+        top_p: 0.9
+      }),
+    });
+
+    clearTimeout(timeout);
+
+    if (!nvidiaResponse.ok) {
+      const errText = await nvidiaResponse.text();
+      console.error(`NVIDIA API Error (/ai/product-content): ${nvidiaResponse.status} ${nvidiaResponse.statusText}`);
+      return res.status(500).json({ error: 'AI provider error' });
+    }
+
+    const nvidiaData = await nvidiaResponse.json();
+    const replyText = nvidiaData.choices?.[0]?.message?.content || "";
+    
+    if (!replyText) {
+      return res.status(500).json({ error: 'AI returned empty response' });
+    }
+
+    return res.json({ text: replyText });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error("NVIDIA API Timeout (/ai/product-content)");
+      return res.status(504).json({ error: 'timeout', message: 'Request to AI provider timed out.' });
+    }
+    console.error("Error in /ai/product-content:", error.message);
+    if (error.message && error.message.includes('auth')) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Authentication failed' });
+    }
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------------------------
+// Endpoint d�di� sp�cifique pour le Marketing (Phase 1G.4.2)
+// S�curis� : Authentification, Validation stricte des inputs, Mod�le et Prompt serveur
+// ---------------------------
+const marketingRateLimits = new Map();
+
+app.post('/ai/marketing', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
+
+    const now = Date.now();
+    const userLimit = marketingRateLimits.get(uid) || { count: 0, windowStart: now };
+    if (now - userLimit.windowStart > 60000) {
+      userLimit.count = 1;
+      userLimit.windowStart = now;
+    } else {
+      userLimit.count++;
+      if (userLimit.count > 15) {
+        return res.status(429).json({ error: 'rate_limit', message: 'Too many requests for Marketing AI' });
+      }
+    }
+    marketingRateLimits.set(uid, userLimit);
+
+    const { operation, language = 'French' } = req.body;
+    
+    if (!['French', 'English', 'Espa�ol'].includes(language)) {
+      return res.status(400).json({ error: 'invalid_language' });
+    }
+
+    let systemPrompt = '';
+    let userPrompt = '';
+
+    if (operation === 'caption') {
+      const { platform, tone, productName, city, options } = req.body;
+      
+      if (typeof platform !== 'string' || platform.length > 50) return res.status(400).json({ error: 'invalid_platform' });
+      if (typeof productName !== 'string' || productName.length > 150) return res.status(400).json({ error: 'invalid_productName' });
+      
+      const safeTone = (typeof tone === 'string' && tone.length <= 50) ? tone.replace(/"/g, '') : 'Vendeur';
+      const safeCity = (typeof city === 'string' && city.length <= 50) ? city : 'Abidjan';
+      
+      const emojis = !!options?.emojis;
+      const hashtags = !!options?.hashtags;
+      const cta = !!options?.cta;
+      const promo = !!options?.promo;
+      const location = !!options?.location;
+
+      if (language === 'English') {
+        systemPrompt = `You are a digital marketing expert for e-commerce in Ivory Coast.\nGenerate 3 variants of captions for ${platform} with tone "${safeTone}".`;
+        if (platform.toLowerCase().includes('whatsapp status') || platform.toLowerCase() === 'whatsapp') {
+          systemPrompt = `You are a digital marketing expert for e-commerce in Ivory Coast.\nGenerate 3 variants of WhatsApp status with tone "${safeTone}": one short and punchy, one narrative/emotional, and one aggressive flash-sale style.`;
+        }
+        userPrompt = `Product: ${productName}\nLocation: ${safeCity}\nOptions: Emojis=${emojis}, Hashtags=${hashtags}, CTA=${cta}, Promo=${promo}, Location=${location}\n\nRespond ONLY with a JSON array of 3 strings, one per line, without markdown.`;
+      } else if (language === 'Espa�ol') {
+        systemPrompt = `Eres un experto en marketing digital para el comercio electr�nico en Costa de Marfil.\nGenera 3 variantes de captions para ${platform} con el tono "${safeTone}".`;
+        if (platform.toLowerCase().includes('whatsapp status') || platform.toLowerCase() === 'whatsapp') {
+          systemPrompt = `Eres un experto en marketing digital para el comercio electr�nico en Costa de Marfil.\nGenera 3 variantes de estado de WhatsApp con el tono "${safeTone}": una corta e impactante, una narrativa/emotiva, y una agresiva estilo venta flash.`;
+        }
+        userPrompt = `Producto: ${productName}\nUbicaci�n: ${safeCity}\nOpciones: Emojis=${emojis}, Hashtags=${hashtags}, CTA=${cta}, Promo=${promo}, Ubicaci�n=${location}\n\nResponde �NICAMENTE con un array JSON de 3 strings, uno por l�nea, sin markdown.`;
+      } else {
+        systemPrompt = `Tu es un expert en marketing digital pour le e-commerce en C�te d'Ivoire.\nG�n�re 3 variantes de captions pour ${platform} avec le ton "${safeTone}".`;
+        if (platform.toLowerCase().includes('whatsapp status') || platform.toLowerCase() === 'whatsapp') {
+          systemPrompt = `Tu es un expert en marketing digital pour le e-commerce en C�te d'Ivoire.\nG�n�re 3 variantes de statut WhatsApp avec le ton "${safeTone}" : une courte et percutante, une storytelling/�motive, une agressive style vente flash.`;
+        }
+        userPrompt = `Produit : ${productName}\nLocalisation : ${safeCity}\nOptions : Emojis=${emojis}, Hashtags=${hashtags}, CTA=${cta}, Promo=${promo}, Mention localisation=${location}\n\nR�ponds UNIQUEMENT avec un JSON array de 3 strings, une par ligne, sans markdown.`;
+      }
+
+    } else if (operation === 'campaign') {
+      const { channel, campaignName, productNames } = req.body;
+      
+      if (typeof channel !== 'string' || channel.length > 50) return res.status(400).json({ error: 'invalid_channel' });
+      if (typeof campaignName !== 'string' || campaignName.length > 100) return res.status(400).json({ error: 'invalid_campaignName' });
+      
+      const safeProductNames = (typeof productNames === 'string') ? productNames.substring(0, 300) : 'divers produits';
+      const ctaWhatsAppFr = channel.toLowerCase() === 'whatsapp' ? "Inclus un appel � l'action pour contacter le vendeur et commander." : "";
+      const ctaWhatsAppEn = channel.toLowerCase() === 'whatsapp' ? "Include a call to action to contact the seller and order." : "";
+      const ctaWhatsAppEs = channel.toLowerCase() === 'whatsapp' ? "Incluye una llamada a la acci�n para escribir al vendedor y pedir." : "";
+      
+      if (language === 'English') {
+        systemPrompt = `You are a digital marketing expert for e-commerce in Ivory Coast.\nGenerate 3 short variants of marketing messages for a "${channel}" campaign named "${campaignName}".`;
+        userPrompt = `Featured products: ${safeProductNames}\n${ctaWhatsAppEn}\n\nRespond ONLY with a JSON array of 3 strings, without markdown.`;
+      } else if (language === 'Espa�ol') {
+        systemPrompt = `Eres un experto en marketing digital para el comercio electr�nico en Costa de Marfil.\nGenera 3 variantes cortas de mensajes de marketing para una campa�a "${channel}" llamada "${campaignName}".`;
+        userPrompt = `Productos destacados: ${safeProductNames}\n${ctaWhatsAppEs}\n\nResponde �NICAMENTE con un array JSON de 3 strings, sin markdown.`;
+      } else {
+        systemPrompt = `Tu es un expert en marketing digital pour le e-commerce en C�te d'Ivoire.\nG�n�re 3 variantes courtes de messages marketing pour une campagne "${channel}" nomm�e "${campaignName}".`;
+        userPrompt = `Produits mis en avant : ${safeProductNames}\n${ctaWhatsAppFr}\n\nR�ponds UNIQUEMENT avec un JSON array de 3 strings, sans markdown.`;
+      }
+    } else {
+      return res.status(400).json({ error: 'invalid_operation' });
+    }
+
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), 60000);
+
+    const nvidiaResponse = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
+      },
+      signal: abortController.signal,
+      body: JSON.stringify({
+        model: 'meta/llama-3.2-11b-vision-instruct',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        max_tokens: 500,
+        temperature: 0.8,
+        top_p: 0.9
+      }),
+    });
+
+    clearTimeout(timeout);
+
+    if (!nvidiaResponse.ok) {
+      console.error(`NVIDIA API Error (/ai/marketing): ${nvidiaResponse.status} ${nvidiaResponse.statusText}`);
+      return res.status(500).json({ error: 'AI provider error' });
+    }
+
+    const nvidiaData = await nvidiaResponse.json();
+    const replyText = nvidiaData.choices?.[0]?.message?.content || "";
+    
+    if (!replyText) {
+      return res.status(500).json({ error: 'AI returned empty response' });
+    }
+
+    let variants = [];
+    try {
+      let cleanText = replyText.trim();
+      if (cleanText.startsWith('```json')) {
+        cleanText = cleanText.substring(7);
+      } else if (cleanText.startsWith('```')) {
+        cleanText = cleanText.substring(3);
+      }
+      if (cleanText.endsWith('```')) {
+        cleanText = cleanText.substring(0, cleanText.length - 3);
+      }
+      cleanText = cleanText.trim();
+
+      const parsed = JSON.parse(cleanText);
+      if (Array.isArray(parsed)) {
+        variants = parsed.map(e => String(e).trim());
+      } else {
+        throw new Error('Not a JSON array');
+      }
+    } catch (parseError) {
+      variants = replyText.split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0 && !line.startsWith('[') && !line.startsWith(']'))
+        .slice(0, 3);
+    }
+    
+    if (variants.length === 0) {
+      return res.status(500).json({ error: 'AI generated invalid format' });
+    }
+
+    if (variants.length > 3) {
+      variants = variants.slice(0, 3);
+    }
+
+    return res.json({ variants });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error("NVIDIA API Timeout (/ai/marketing)");
+      return res.status(504).json({ error: 'timeout', message: 'Request to AI provider timed out.' });
+    }
+    console.error("Error in /ai/marketing:", error.message);
+    if (error.message && error.message.includes('auth')) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Authentication failed' });
+    }
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+const summarizeRateLimits = new Map();
+
+app.post('/ai/summarize-chat', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
+
+    const now = Date.now();
+    const userLimit = summarizeRateLimits.get(uid) || { count: 0, windowStart: now };
+    if (now - userLimit.windowStart > 60000) {
+      userLimit.count = 1;
+      userLimit.windowStart = now;
+    } else {
+      userLimit.count++;
+      if (userLimit.count > 15) {
+        return res.status(429).json({
+          error: 'rate_limit_exceeded',
+          message: 'Too many AI requests. Please try again later.'
+        });
+      }
+    }
+    summarizeRateLimits.set(uid, userLimit);
+
+    let { chatContent, type, language } = req.body || {};
+
+    if (chatContent == null || typeof chatContent !== 'string') {
+      return res.status(400).json({ error: 'chatContent is required and must be a string' });
+    }
+    chatContent = chatContent.trim();
+    if (chatContent.length === 0) {
+      return res.status(400).json({ error: 'chatContent cannot be empty' });
+    }
+    if (chatContent.length > 4000) {
+      chatContent = chatContent.substring(0, 4000);
+    }
+
+    const ALLOWED_SUMMARY_TYPES = new Set(['customer', 'workspace']);
+    if (type == null) {
+      type = 'customer';
+    } else if (!ALLOWED_SUMMARY_TYPES.has(type)) {
+      return res.status(400).json({ error: 'Invalid type' });
+    }
+
+    const ALLOWED_LANGUAGES = new Set(['French', 'English', 'Español']);
+    if (language == null) {
+      language = 'French';
+    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'Espa\u00f1ol' && !language.startsWith('Espa')) {
+      return res.status(400).json({ error: 'Invalid language' });
+    }
+    if (language && language.startsWith('Espa')) language = 'Español';
+
+    let systemPrompt = "";
+    if (type === 'customer') {
+      if (language === 'English') {
+        systemPrompt = "You are the AI assistant of W-COM. Summarize this commercial conversation in 2 to 3 sentences. Highlight the main intent, important requests, and useful elements for the seller. Be factual and concise. Do not create any information not present in the conversation.";
+      } else if (language === 'Español') {
+        systemPrompt = "Eres el asistente de IA de W-COM. Resume esta conversación comercial en 2 a 3 oraciones. Destaca la intención principal, las solicitudes importantes y los elementos útiles para el vendedor. Sé factual y conciso. No crees información que no esté en la conversación.";
+      } else {
+        systemPrompt = "Tu es l'assistant IA de W-COM. Résume cette conversation commerciale en 2 à 3 phrases. Mets en évidence l'intention principale, les demandes importantes et les éléments utiles pour le vendeur. Reste factuel et concis. Ne crée aucune information absente de la conversation.";
+      }
+    } else if (type === 'workspace') {
+      if (language === 'English') {
+        systemPrompt = "You are the AI assistant of W-COM Workspace. Summarize this professional conversation in 2 to 3 sentences. Highlight decisions, problems, important requests, and next actions when explicitly present. Be factual and concise. Do not create any information not present in the conversation.";
+      } else if (language === 'Español') {
+        systemPrompt = "Eres el asistente de IA de W-COM Workspace. Resume esta conversación profesional en 2 a 3 oraciones. Destaca decisiones, problemas, solicitudes importantes y próximos pasos cuando estén explícitamente presentes. Sé factual y conciso. No crees información que no esté en la conversación.";
+      } else {
+        systemPrompt = "Tu es l'assistant IA de W-COM Workspace. Résume cette conversation professionnelle en 2 à 3 phrases. Mets en évidence les décisions, problèmes, demandes importantes et prochaines actions lorsqu'elles sont explicitement présentes. Reste factuel et concis. Ne crée aucune information absente de la conversation.";
+      }
+    }
+
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), 60000);
+
+    const nvidiaResponse = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
+      },
+      signal: abortController.signal,
+      body: JSON.stringify({
+        model: 'meta/llama-3.2-11b-vision-instruct',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: chatContent }
+        ],
+        max_tokens: 150,
+        temperature: 0.3,
+        top_p: 0.9
+      }),
+    });
+
+    clearTimeout(timeout);
+
+    if (!nvidiaResponse.ok) {
+      const errText = await nvidiaResponse.text();
+      console.error(`NVIDIA API Error (/ai/summarize-chat): ${nvidiaResponse.status} ${nvidiaResponse.statusText}`);
+      return res.status(500).json({ error: 'AI provider error' });
+    }
+
+    const nvidiaData = await nvidiaResponse.json();
+    const replyText = nvidiaData.choices?.[0]?.message?.content || "";
+
+    return res.json({ text: replyText });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error("NVIDIA API Timeout (/ai/summarize-chat)");
+      return res.status(504).json({ error: 'timeout', message: 'Request to AI provider timed out.' });
+    }
+    console.error("Error in /ai/summarize-chat:", error.message);
+    if (error.message && error.message.includes('auth')) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Authentication failed' });
+    }
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+// ---------------------------
+// Endpoint dAcclAc spAccifique pour le Workspace Copilot (Phase 1F.4)
+// SAccurisAc : Authentification, Autorisation Workspace, AgrAcgation Firestore
+// et Prompt Engineering sAccurisAc cAtAc serveur.
+// ---------------------------
+const aiRateLimits = new Map();
+
+app.post('/ai/workspace-copilot', async (req, res) => {
+  try {
+    // 1. Authentification Firebase
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
+
+    // Rate Limiting (en mAcmOire, basique : max 10 requAtes / minute / UID)
+    const now = Date.now();
+    const userLimit = aiRateLimits.get(uid) || { count: 0, windowStart: now };
+    if (now - userLimit.windowStart > 60000) {
+      userLimit.count = 1;
+      userLimit.windowStart = now;
+    } else {
+      userLimit.count++;
+      if (userLimit.count > 10) {
+        return res.status(429).json({ error: 'Rate limit exceeded. Please wait.' });
+      }
+    }
+    aiRateLimits.set(uid, userLimit);
+
+    const { workspaceId, message, history } = req.body || {};
+
+    if (!workspaceId) {
+      return res.status(400).json({ error: 'workspaceId required' });
+    }
+    if (!message) {
+      return res.status(400).json({ error: 'message required' });
+    }
+
+    if (!db) {
+      return res.status(500).json({ error: 'Firestore not initialized' });
+    }
+
+    // 2. VAcrification d'Autorisation Workspace (RAcservAc Admin/Manager)
+    const memberSnap = await db.collection('workspaces').doc(workspaceId).collection('members').doc(uid).get();
+    if (!memberSnap.exists) {
+      return res.status(403).json({ error: 'Access denied: not a workspace member' });
+    }
+    const role = memberSnap.data().role;
+    if (role !== 'admin' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied: Copilot requires admin or manager role' });
+    }
+
+    // 3. AgrAcgation du Contexte Firestore (cAtAc serveur)
+    let contextBuffer = '';
+    try {
+      const projSnap = await db.collection('workspaces').doc(workspaceId).collection('projects').limit(5).get();
+      if (!projSnap.empty) {
+        contextBuffer += '\nProjets en cours :\n';
+        projSnap.forEach(doc => {
+          const d = doc.data();
+          contextBuffer += `- ${d.title || d.name || 'Projet'} (Progression: ${d.progress || 0}%, Statut: ${d.status || 'En cours'})\n`;
+        });
+      }
+
+      const candSnap = await db.collection('workspaces').doc(workspaceId).collection('applications').limit(5).get();
+      if (!candSnap.empty) {
+        contextBuffer += '\nCandidatures rAccentes :\n';
+        candSnap.forEach(doc => {
+          const d = doc.data();
+          contextBuffer += `- ${d.name || d.candidateName || 'Candidat'} pour le poste "${d.role || d.jobTitle || 'Poste'}" (Statut: ${d.status || 'En attente'})\n`;
+        });
+      }
+
+      let teamSnap = await db.collection('workspaces').doc(workspaceId).collection('team').limit(6).get();
+      if (teamSnap.empty) {
+        teamSnap = await db.collection('workspaces').doc(workspaceId).collection('members').limit(6).get();
+      }
+      if (!teamSnap.empty) {
+        contextBuffer += '\nMembres de l\'equipe :\n';
+        teamSnap.forEach(doc => {
+          const d = doc.data();
+          contextBuffer += `- ${d.name || d.displayName || 'Membre'} (${d.role || 'worker'})\n`;
+        });
+      }
+    } catch (e) {
+      console.error('Erreur lors de la rAccupAcration du contexte Firestore:', e);
+    }
+
+    // 4. Prompt Engineering SAccurisAc
+    const systemPrompt = `Tu es Repos AI (dY - Repos), l'assistant intelligent, autonome et amical de cet espace de travail W-COM.
+Tu peux discuter de maniA"re fluide, naturelle et professionnelle de tout sujet (salutations, actualitAcs, conseils stratAcgiques, mActAco, travail quotidien, gestion de projet, etc.).
+
+Voici les donnAces en direct de l'espace de travail :
+${contextBuffer.trim() === '' ? 'Aucune donnAce enregistrAce pour le moment.' : contextBuffer.trim()}
+
+INSTRUCTIONS IMPORTANTES :
+1. RAcponds toujours en franA ais dans un style chaleureux, dynamique, bienveillant et concis (avec des emojis adaptAcs).
+2. Si l'utilisateur te demande de CRA%ER une tAche (ou s'il exprime une action claire du type "crAce une tAche pour X", "ajoute une tAche", "fais une tAche"), rAcponds amicalement en expliquant ce que tu prAcpares, ET ajoute OBLIGATOIREMENT A la fin exacte de ton message ce tag spAccial :
+[ACTION_PROPOSAL: {"type": "createTask", "title": "<Titre court de la tAche>", "description": "<Description claire de la tAche>", "targetAssignee": "<Nom de la personne ou Acquipe>", "priority": "Normale"}]
+3. Tu as accA"s aux donnAces de projets et de candidatures ci-dessus. Utilise-les pour donner des rAcponses prAccises et personnalisAces.`;
+
+    const apiMessages = [{ role: 'system', content: systemPrompt }];
+
+    // Ajout de l'historique bridAc cAtAc serveur (max 8 messages)
+    if (Array.isArray(history)) {
+      const recentHistory = history.length > 8 ? history.slice(-8) : history;
+      recentHistory.forEach(msg => {
+        if (msg.role && msg.content) {
+          apiMessages.push({ role: msg.role === 'user' ? 'user' : 'assistant', content: msg.content });
+        }
+      });
+    }
+
+    // Ajout de la nouvelle requAte
+    apiMessages.push({ role: 'user', content: message });
+
+    // 5. Appel sAccurisAc A NVIDIA
+    const targetModel = 'meta/llama-3.2-90b-vision-instruct';
 
     const nvidiaResponse = await fetch(
       'https://integrate.api.nvidia.com/v1/chat/completions',
@@ -1080,11 +2019,10 @@ app.post('/ai/chat', async (req, res) => {
           Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
         },
         body: JSON.stringify({
-          model,
-          messages,
-          max_tokens: cappedMaxTokens,
-          ...(temperature !== undefined ? { temperature } : {}),
-          ...(top_p !== undefined ? { top_p } : {}),
+          model: targetModel,
+          messages: apiMessages,
+          max_tokens: 700,
+          temperature: 0.7,
         }),
       }
     );
@@ -1092,7 +2030,7 @@ app.post('/ai/chat', async (req, res) => {
     const data = await nvidiaResponse.json();
     res.status(nvidiaResponse.status).json(data);
   } catch (e) {
-    console.error(e);
+    console.error('/ai/workspace-copilot error:', e);
     res.status(e.statusCode || 500).json({ error: e.message });
   }
 });
@@ -1350,3 +2288,7 @@ cron.schedule('*/5 * * * *', () => {
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
 });
+
+
+
+

@@ -6,7 +6,9 @@ const cors = require('cors');
 const crypto = require('crypto');
 const cron = require('node-cron');
 const admin = require('firebase-admin');
+const cloudinary = require('cloudinary').v2;
 
+const signUploadRateLimits = new Map();
 const app = express();
 app.use(cors());
 // On garde le corps brut (req.rawBody) en plus du JSON parsé : la vérification
@@ -18,6 +20,67 @@ app.use(express.json({
     req.rawBody = buf;
   },
 }));
+
+
+const signDeliveryRateLimits = new Map();
+
+// ==========================================
+// CLOUDINARY SIGN-DELIVERY ENDPOINT
+// ==========================================
+app.post('/api/cloudinary/sign-delivery', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
+
+    if (!process.env.CLOUDINARY_API_SECRET || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_CLOUD_NAME) {
+      return res.status(500).json({ error: 'Cloudinary configuration missing' });
+    }
+
+    // Rate limiting: 60 req / min / uid
+    const now = Date.now();
+    const rateData = signDeliveryRateLimits.get(uid) || { count: 0, resetTime: now + 60000 };
+    if (now > rateData.resetTime) {
+      rateData.count = 0;
+      rateData.resetTime = now + 60000;
+    }
+    rateData.count++;
+    signDeliveryRateLimits.set(uid, rateData);
+    if (rateData.count > 60) {
+      return res.status(429).json({ error: 'Rate limit exceeded' });
+    }
+
+    const { public_id } = req.body || {};
+    if (!public_id) {
+      return res.status(400).json({ error: 'missing public_id' });
+    }
+
+    // Authorization: User can only sign URLs for their own chat_media folders
+    const ecommercePrefix = `chat_media/ecommerce/${uid}/`;
+    const reposPrefix = `chat_media/repos/${uid}/`;
+    
+    if (!public_id.startsWith(ecommercePrefix) && !public_id.startsWith(reposPrefix)) {
+      console.warn(`[AuthZ] uid ${uid} attempted to access unauthorized public_id: ${public_id}`);
+      return res.status(403).json({ error: 'Forbidden: Cannot access media belonging to another user' });
+    }
+
+    // Generate signed URL
+    const url = cloudinary.url(public_id, {
+      type: 'authenticated',
+      secure: true,
+      sign_url: true,
+      expires_at: Math.floor(Date.now() / 1000) + 3600 // expires in 1 hour (optional but good practice)
+    });
+
+    return res.status(200).json({ url });
+  } catch (err) {
+    console.error('Error in /api/cloudinary/sign-delivery:', err);
+    if (err.message && err.message.includes('auth')) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Authentication failed' });
+    }
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 
 const PORT = process.env.PORT || 3000; // Render will inject its own PORT
 const ONESIGNAL_APP_ID = '38e7126f-2c23-4ee7-b715-6db2718ea78f';
@@ -1436,10 +1499,12 @@ app.post('/ai/product-content', async (req, res) => {
       return res.status(400).json({ error: 'invalid operation' });
     }
 
+        if (language && (language.toLowerCase().startsWith('fran') || language.toLowerCase() === 'french')) language = 'French';
+    if (language && (language.toLowerCase().startsWith('anglais') || language.toLowerCase() === 'english')) language = 'English';
     const ALLOWED_LANGUAGES = new Set(['French', 'English', 'Español']);
     if (language == null) {
       language = 'French';
-    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'Espa\u00f1ol' && !language.startsWith('Espa')) {
+    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'Español' && !language.startsWith('Espa')) {
       return res.status(400).json({ error: 'invalid language' });
     }
     if (language && language.startsWith('Espa')) language = 'Español';
@@ -1818,10 +1883,12 @@ app.post('/ai/summarize-chat', async (req, res) => {
       return res.status(400).json({ error: 'Invalid type' });
     }
 
+        if (language && (language.toLowerCase().startsWith('fran') || language.toLowerCase() === 'french')) language = 'French';
+    if (language && (language.toLowerCase().startsWith('anglais') || language.toLowerCase() === 'english')) language = 'English';
     const ALLOWED_LANGUAGES = new Set(['French', 'English', 'Español']);
     if (language == null) {
       language = 'French';
-    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'Espa\u00f1ol' && !language.startsWith('Espa')) {
+    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'Español' && !language.startsWith('Espa')) {
       return res.status(400).json({ error: 'Invalid language' });
     }
     if (language && language.startsWith('Espa')) language = 'Español';
@@ -2283,6 +2350,75 @@ cron.schedule('*/5 * * * *', () => {
   reconcileBusinessHours();
   reconcileSubscriptionExpiry();
   reconcileSubscriptionReminders();
+});
+
+
+// ==========================================
+// CLOUDINARY SIGN-UPLOAD ENDPOINT
+// ==========================================
+app.post('/api/cloudinary/sign-upload', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
+
+    if (!process.env.CLOUDINARY_API_SECRET || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_CLOUD_NAME) {
+      return res.status(500).json({ error: 'Cloudinary configuration missing' });
+    }
+
+    // Rate limiting
+    const now = Date.now();
+    const rateData = signUploadRateLimits.get(uid) || { count: 0, resetTime: now + 60000 };
+    if (now > rateData.resetTime) {
+      rateData.count = 0;
+      rateData.resetTime = now + 60000;
+    }
+    rateData.count++;
+    signUploadRateLimits.set(uid, rateData);
+    if (rateData.count > 10) {
+      return res.status(429).json({ error: 'Rate limit exceeded' });
+    }
+
+    const { folder, resource_type, type } = req.body || {};
+
+    if (!folder) return res.status(400).json({ error: 'missing folder' });
+    if (!resource_type) return res.status(400).json({ error: 'missing resource_type' });
+    if (!type) return res.status(400).json({ error: 'missing type' });
+
+    if (resource_type !== 'image') return res.status(400).json({ error: 'unsupported resource_type' });
+    if (type !== 'authenticated') return res.status(400).json({ error: 'unsupported type' });
+
+    if (folder !== `chat_media/ecommerce/${uid}` && folder !== `chat_media/repos/${uid}`) {
+      return res.status(403).json({ error: 'folder not authorized for this UID' });
+    }
+
+    const timestamp = Math.round(new Date().getTime() / 1000);
+
+    const paramsToSign = {
+      folder,
+      timestamp,
+      resource_type,
+      type
+    };
+
+    const signature = cloudinary.utils.api_sign_request(
+      paramsToSign,
+      process.env.CLOUDINARY_API_SECRET
+    );
+
+    return res.status(200).json({
+      signature,
+      timestamp,
+      api_key: process.env.CLOUDINARY_API_KEY,
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+      type: 'authenticated'
+    });
+
+  } catch (error) {
+    if (error.statusCode === 401) {
+      return res.status(401).json({ error: error.message });
+    }
+    return res.status(500).json({ error: 'Internal server error during signing' });
+  }
 });
 
 app.listen(PORT, () => {

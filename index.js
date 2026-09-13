@@ -1152,9 +1152,79 @@ app.post('/ai/repos-assistant', async (req, res) => {
     
     let safeHistory = [];
     if (Array.isArray(history)) {
-      safeHistory = history
+      const filteredHistory = history
         .filter(h => h.role === 'user' || h.role === 'assistant')
         .slice(-8); // keep last 8
+        
+      safeHistory = await Promise.all(filteredHistory.map(async msg => {
+          let content = msg.content || '';
+          if (Array.isArray(content)) {
+            content = await Promise.all(content.map(async block => {
+              if (block && block.type === 'cloudinary_image' && block.public_id) {
+                const pid = block.public_id;
+                
+                // 1. Validation stricte et anti-path-traversal
+                if (typeof pid !== 'string') {
+                  const err = new Error('INVALID_MEDIA_REFERENCE'); err.statusCode = 400; throw err;
+                }
+                if (pid.includes('..') || pid.includes('//') || pid.includes('\\') || pid.includes('./')) {
+                  const err = new Error('INVALID_MEDIA_PATH'); err.statusCode = 400; throw err;
+                }
+                
+                const prefixEco = `chat_media/ecommerce/${uid}/`;
+                const prefixRepos = `chat_media/repos/${uid}/`;
+                
+                if (!pid.startsWith(prefixEco) && !pid.startsWith(prefixRepos)) {
+                  console.error(`Tentative d'accès non autorisé au media ${pid} par l'UID ${uid}`);
+                  const err = new Error('UNAUTHORIZED_MEDIA'); err.statusCode = 403; throw err;
+                }
+                
+                const assetPart = pid.startsWith(prefixEco) ? pid.substring(prefixEco.length) : pid.substring(prefixRepos.length);
+                if (!assetPart || assetPart.trim() === '' || assetPart.includes('/')) {
+                  const err = new Error('INVALID_ASSET_NAME'); err.statusCode = 400; throw err;
+                }
+
+                // 2. Fetch sécurisé et gestion des erreurs Cloudinary (Fail-Closed sans falsifier le prompt)
+                try {
+                  const url = cloudinary.url(pid, {
+                    type: 'authenticated',
+                    secure: true,
+                    sign_url: true,
+                  });
+                  const imgRes = await fetch(url);
+                  if (!imgRes.ok) {
+                    console.error(`Cloudinary fetch error: ${imgRes.status}`);
+                    const err = new Error('MEDIA_UNAVAILABLE');
+                    err.statusCode = imgRes.status === 404 ? 404 : 502;
+                    throw err;
+                  }
+                  const buffer = await imgRes.arrayBuffer();
+                  const base64Image = Buffer.from(buffer).toString('base64');
+                  
+                  let mimeType = 'image/jpeg';
+                  if (pid.toLowerCase().endsWith('.png')) mimeType = 'image/png';
+                  if (pid.toLowerCase().endsWith('.gif')) mimeType = 'image/gif';
+                  
+                  return {
+                    type: 'image_url',
+                    image_url: { url: `data:${mimeType};base64,${base64Image}` }
+                  };
+                } catch (imgError) {
+                  console.error('Cloudinary fetch exception:', imgError);
+                  if (imgError.message === 'MEDIA_UNAVAILABLE') throw imgError;
+                  const err = new Error('MEDIA_UNAVAILABLE');
+                  err.statusCode = 502;
+                  throw err;
+                }
+              }
+              return block;
+            }));
+          }
+          return {
+            role: msg.role,
+            content
+          };
+        }));
     }
 
     const storeSnap = await db.collection('stores').doc(storeId).get();

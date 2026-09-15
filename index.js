@@ -1,4 +1,4 @@
-// index.js
+﻿// index.js
 require('dotenv').config();          // loads .env locally (development only)
 
 const express = require('express');
@@ -11,10 +11,10 @@ const cloudinary = require('cloudinary').v2;
 const signUploadRateLimits = new Map();
 const app = express();
 app.use(cors());
-// On garde le corps brut (req.rawBody) en plus du JSON parsé : la vérification
-// de signature du webhook Genius Pay porte sur les octets exacts envoyés, pas
-// sur une version re-sérialisée par JSON.stringify (qui peut différer par
-// l'ordre des clés ou les espaces).
+// On garde le corps brut (req.rawBody) en plus du JSON parsÃ© : la vÃ©rification
+// de signature du webhook Genius Pay porte sur les octets exacts envoyÃ©s, pas
+// sur une version re-sÃ©rialisÃ©e par JSON.stringify (qui peut diffÃ©rer par
+// l'ordre des clÃ©s ou les espaces).
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;
@@ -86,11 +86,11 @@ const PORT = process.env.PORT || 3000; // Render will inject its own PORT
 const ONESIGNAL_APP_ID = '38e7126f-2c23-4ee7-b715-6db2718ea78f';
 
 // ---------------------------
-// Firebase Admin -- nécessaire pour que le webhook puisse confirmer un
+// Firebase Admin -- nÃ©cessaire pour que le webhook puisse confirmer un
 // paiement dans Firestore (users/orders/subscriptionPayments/notifications).
-// Best-effort : si la clé de service n'est pas configurée, /payment continue
-// de fonctionner normalement, seul le webhook est inopérant (avec un message
-// d'erreur explicite dans les logs à chaque appel).
+// Best-effort : si la clÃ© de service n'est pas configurÃ©e, /payment continue
+// de fonctionner normalement, seul le webhook est inopÃ©rant (avec un message
+// d'erreur explicite dans les logs Ã  chaque appel).
 // ---------------------------
 let db = null;
 try {
@@ -99,12 +99,12 @@ try {
     const serviceAccount = JSON.parse(serviceAccountJson);
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     db = admin.firestore();
-    console.log('✅ Firebase Admin initialisé');
+    console.log('âœ… Firebase Admin initialisÃ©');
   } else {
-    console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT_JSON absent -- le webhook Genius Pay ne pourra pas confirmer les paiements dans Firestore.');
+    console.warn('âš ï¸ FIREBASE_SERVICE_ACCOUNT_JSON absent -- le webhook Genius Pay ne pourra pas confirmer les paiements dans Firestore.');
   }
 } catch (e) {
-  console.error('❌ Échec init Firebase Admin:', e.message);
+  console.error('âŒ Ã‰chec init Firebase Admin:', e.message);
 }
 
 // ---------------------------
@@ -167,7 +167,7 @@ async function notifySellerPush(sellerId, title, message, data) {
       }),
     });
   } catch (e) {
-    console.error('⚠️ Push OneSignal échoué:', e.message);
+    console.error('âš ï¸ Push OneSignal Ã©chouÃ©:', e.message);
   }
 }
 
@@ -195,7 +195,7 @@ async function notifyBuyersPush(buyerIds, title, message, data) {
       }),
     });
   } catch (e) {
-    console.error('⚠️ Push OneSignal (campagne) échoué:', e.message);
+    console.error('âš ï¸ Push OneSignal (campagne) Ã©chouÃ©:', e.message);
   }
 }
 
@@ -214,8 +214,8 @@ app.post('/payment', async (req, res) => {
 });
 
 // ---------------------------
-// Vérification manuelle d'une transaction (repli côté app si le webhook n'a
-// pas encore confirmé -- voir genius_pay_service.dart::verifyTransaction).
+// VÃ©rification manuelle d'une transaction (repli cÃ´tÃ© app si le webhook n'a
+// pas encore confirmÃ© -- voir genius_pay_service.dart::verifyTransaction).
 // ---------------------------
 app.get('/transaction/verify/:reference', async (req, res) => {
   try {
@@ -230,22 +230,22 @@ app.get('/transaction/verify/:reference', async (req, res) => {
 // ---------------------------
 // Webhook Genius Pay -- confirmation ASYNCHRONE de paiement.
 //
-// Avant ce webhook, l'app mobile considérait une commande/un abonnement comme
-// payé dès l'OUVERTURE de la page de paiement Genius Pay (openCheckout), pas
-// à la confirmation réelle -- un client qui annulait laissait une commande
-// bloquée pour toujours, panier déjà vidé. Ce webhook devient la seule source
-// de vérité pour "le paiement a réellement abouti".
+// Avant ce webhook, l'app mobile considÃ©rait une commande/un abonnement comme
+// payÃ© dÃ¨s l'OUVERTURE de la page de paiement Genius Pay (openCheckout), pas
+// Ã  la confirmation rÃ©elle -- un client qui annulait laissait une commande
+// bloquÃ©e pour toujours, panier dÃ©jÃ  vidÃ©. Ce webhook devient la seule source
+// de vÃ©ritÃ© pour "le paiement a rÃ©ellement abouti".
 //
 // Contrat avec l'app (lib/services/genius_pay_service.dart) : le `metadata`
-// envoyé à la création du paiement revient tel quel dans `data.metadata` du
+// envoyÃ© Ã  la crÃ©ation du paiement revient tel quel dans `data.metadata` du
 // webhook. `metadata.paymentKind` distingue :
 //   - 'subscription' (payment_screen.dart)  -> userId, planName, days,
 //     subscriptionPaymentId
 //   - 'driver_subscription' (livreur_subscription_screen.dart) -> userId,
-//     days, subscriptionPaymentId (même schéma que 'subscription', mais
-//     écrit sur public_drivers/{userId} au lieu de users/{userId} -- un
-//     compte peut être vendeur ET livreur en même temps, les deux
-//     abonnements doivent rester indépendants)
+//     days, subscriptionPaymentId (mÃªme schÃ©ma que 'subscription', mais
+//     Ã©crit sur public_drivers/{userId} au lieu de users/{userId} -- un
+//     compte peut Ãªtre vendeur ET livreur en mÃªme temps, les deux
+//     abonnements doivent rester indÃ©pendants)
 //   - 'order' (checkout_screen.dart)        -> orderId, buyerId, sellerId
 // ---------------------------
 function isSignatureValid(req) {
@@ -273,17 +273,17 @@ function isSignatureValid(req) {
 
 app.post('/webhook/genius-pay', async (req, res) => {
   if (!isSignatureValid(req)) {
-    console.warn('🚨 Webhook Genius Pay rejeté : signature invalide ou absente');
+    console.warn('ðŸš¨ Webhook Genius Pay rejetÃ© : signature invalide ou absente');
     return res.status(401).json({ error: 'invalid signature' });
   }
 
-  // On accuse réception tout de suite -- éviter que Genius Pay ne renvoie le
-  // même webhook en boucle pendant qu'on écrit dans Firestore.
+  // On accuse rÃ©ception tout de suite -- Ã©viter que Genius Pay ne renvoie le
+  // mÃªme webhook en boucle pendant qu'on Ã©crit dans Firestore.
   res.status(200).json({ received: true });
 
   if (!db) {
     console.error(
-      '❌ Webhook reçu mais Firebase Admin non configuré -- paiement NON confirmé dans Firestore. reference=',
+      'âŒ Webhook reÃ§u mais Firebase Admin non configurÃ© -- paiement NON confirmÃ© dans Firestore. reference=',
       req.body?.data?.reference,
     );
     return;
@@ -303,17 +303,17 @@ app.post('/webhook/genius-pay', async (req, res) => {
     } else if (metadata.paymentKind === 'campaign') {
       await handleCampaignWebhook(status, metadata);
     } else {
-      console.warn('⚠️ Webhook Genius Pay avec metadata.paymentKind inconnu:', metadata);
+      console.warn('âš ï¸ Webhook Genius Pay avec metadata.paymentKind inconnu:', metadata);
     }
   } catch (e) {
-    console.error('❌ Erreur traitement webhook Genius Pay:', e);
+    console.error('âŒ Erreur traitement webhook Genius Pay:', e);
   }
 });
 
 async function handleSubscriptionWebhook(status, metadata) {
   const { userId, planName, days, subscriptionPaymentId } = metadata;
   if (!userId) {
-    console.error('❌ Webhook abonnement sans userId dans metadata');
+    console.error('âŒ Webhook abonnement sans userId dans metadata');
     return;
   }
 
@@ -329,14 +329,14 @@ async function handleSubscriptionWebhook(status, metadata) {
   }
 
   if (status !== 'completed') {
-    console.log(`ℹ️ Paiement abonnement ${userId} : statut ${status}, aucun changement d'accès`);
+    console.log(`â„¹ï¸ Paiement abonnement ${userId} : statut ${status}, aucun changement d'accÃ¨s`);
     return;
   }
 
-  // Renouvellement anticipé : si l'abonnement en cours n'est pas encore
-  // expiré, les nouveaux jours s'ajoutent à sa date d'expiration au lieu de
+  // Renouvellement anticipÃ© : si l'abonnement en cours n'est pas encore
+  // expirÃ©, les nouveaux jours s'ajoutent Ã  sa date d'expiration au lieu de
   // repartir de maintenant -- sinon un vendeur qui renouvelle quelques jours
-  // avant l'échéance perdait les jours restants déjà payés (signalé
+  // avant l'Ã©chÃ©ance perdait les jours restants dÃ©jÃ  payÃ©s (signalÃ©
   // 2026-09-08, KPI Abonnement).
   const now = Date.now();
   let baseTime = now;
@@ -347,7 +347,7 @@ async function handleSubscriptionWebhook(status, metadata) {
       baseTime = existingExpiry.toDate().getTime();
     }
   } catch (e) {
-    console.error('Lecture subscriptionDate existante échouée, base = maintenant:', e.message);
+    console.error('Lecture subscriptionDate existante Ã©chouÃ©e, base = maintenant:', e.message);
   }
 
   const expiryDate = new Date(baseTime + Number(days || 30) * 24 * 60 * 60 * 1000);
@@ -366,21 +366,21 @@ async function handleSubscriptionWebhook(status, metadata) {
     await storesSnap.docs[0].ref.update({ isActive: true });
   }
 
-  console.log(`✅ Abonnement confirmé pour ${userId} (${planName}), expire le ${expiryDate.toISOString()}`);
+  console.log(`âœ… Abonnement confirmÃ© pour ${userId} (${planName}), expire le ${expiryDate.toISOString()}`);
 }
 
 // Miroir de handleSubscriptionWebhook pour l'abonnement livreur (2 500
-// FCFA/mois, livreur_subscription_screen.dart) -- même logique, mais écrit
+// FCFA/mois, livreur_subscription_screen.dart) -- mÃªme logique, mais Ã©crit
 // sur public_drivers/{userId} (subscriptionActive/subscriptionExpiresAt) au
 // lieu de users/{userId} (isSubscribed/currentPlan), et n'active aucune
-// boutique. Sans ce handler, firestore.rules::public_drivers empêche le
-// client d'écrire ces champs lui-même (audit du 2026-09-04, même faille que
-// users/{userId}.isSubscribed) : le paiement resterait indéfiniment à
+// boutique. Sans ce handler, firestore.rules::public_drivers empÃªche le
+// client d'Ã©crire ces champs lui-mÃªme (audit du 2026-09-04, mÃªme faille que
+// users/{userId}.isSubscribed) : le paiement resterait indÃ©finiment Ã 
 // 'awaiting_checkout'.
 async function handleDriverSubscriptionWebhook(status, metadata) {
   const { userId, days, subscriptionPaymentId } = metadata;
   if (!userId) {
-    console.error('❌ Webhook abonnement livreur sans userId dans metadata');
+    console.error('âŒ Webhook abonnement livreur sans userId dans metadata');
     return;
   }
 
@@ -396,13 +396,13 @@ async function handleDriverSubscriptionWebhook(status, metadata) {
   }
 
   if (status !== 'completed') {
-    console.log(`ℹ️ Paiement abonnement livreur ${userId} : statut ${status}, aucun changement d'accès`);
+    console.log(`â„¹ï¸ Paiement abonnement livreur ${userId} : statut ${status}, aucun changement d'accÃ¨s`);
     return;
   }
 
-  // Même correctif que handleSubscriptionWebhook ci-dessus (2026-09-08) :
+  // MÃªme correctif que handleSubscriptionWebhook ci-dessus (2026-09-08) :
   // cumule sur la date d'expiration existante si elle n'est pas encore
-  // passée, au lieu d'écraser les jours restants déjà payés.
+  // passÃ©e, au lieu d'Ã©craser les jours restants dÃ©jÃ  payÃ©s.
   const now = Date.now();
   let baseTime = now;
   try {
@@ -412,7 +412,7 @@ async function handleDriverSubscriptionWebhook(status, metadata) {
       baseTime = existingExpiry.toDate().getTime();
     }
   } catch (e) {
-    console.error('Lecture subscriptionExpiresAt existante échouée, base = maintenant:', e.message);
+    console.error('Lecture subscriptionExpiresAt existante Ã©chouÃ©e, base = maintenant:', e.message);
   }
 
   const expiryDate = new Date(baseTime + Number(days || 30) * 24 * 60 * 60 * 1000);
@@ -421,20 +421,20 @@ async function handleDriverSubscriptionWebhook(status, metadata) {
     subscriptionExpiresAt: admin.firestore.Timestamp.fromDate(expiryDate),
   });
 
-  console.log(`✅ Abonnement livreur confirmé pour ${userId}, expire le ${expiryDate.toISOString()}`);
+  console.log(`âœ… Abonnement livreur confirmÃ© pour ${userId}, expire le ${expiryDate.toISOString()}`);
 }
 
 async function handleOrderWebhook(status, metadata) {
   const { orderId, buyerId, sellerId } = metadata;
   if (!orderId) {
-    console.error('❌ Webhook commande sans orderId dans metadata');
+    console.error('âŒ Webhook commande sans orderId dans metadata');
     return;
   }
 
   const orderRef = db.collection('orders').doc(orderId);
   const orderSnap = await orderRef.get();
   if (!orderSnap.exists) {
-    console.error(`❌ Webhook commande introuvable: ${orderId}`);
+    console.error(`âŒ Webhook commande introuvable: ${orderId}`);
     return;
   }
   const orderData = orderSnap.data();
@@ -453,13 +453,13 @@ async function handleOrderWebhook(status, metadata) {
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // Notifier le vendeur et vider le panier de l'acheteur -- déplacé ici
+    // Notifier le vendeur et vider le panier de l'acheteur -- dÃ©placÃ© ici
     // depuis le client (checkout_screen.dart), qui ne pouvait pas savoir si
-    // le paiement avait réellement abouti après avoir simplement ouvert la
+    // le paiement avait rÃ©ellement abouti aprÃ¨s avoir simplement ouvert la
     // page de paiement Genius Pay.
     if (sellerId) {
       const title = 'Nouvelle commande';
-      const message = `${orderData.buyerName || 'Un client'} a passé une commande de ${orderData.totalAmount} CFA`;
+      const message = `${orderData.buyerName || 'Un client'} a passÃ© une commande de ${orderData.totalAmount} CFA`;
       await db.collection('notifications').add({
         receiverId: sellerId,
         type: 'order',
@@ -481,18 +481,18 @@ async function handleOrderWebhook(status, metadata) {
       }
     }
 
-    console.log(`✅ Commande ${orderId} confirmée payée`);
+    console.log(`âœ… Commande ${orderId} confirmÃ©e payÃ©e`);
   } else if (['failed', 'cancelled', 'expired'].includes(status)) {
-    // Le panier N'EST PAS vidé : le client garde ses articles et peut
-    // réessayer le paiement.
+    // Le panier N'EST PAS vidÃ© : le client garde ses articles et peut
+    // rÃ©essayer le paiement.
     await orderRef.update({
       paymentStatus: 'checkout_failed',
       status: 'cancelled',
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
     });
-    console.log(`ℹ️ Commande ${orderId} : paiement ${status}, panier conservé pour réessai`);
+    console.log(`â„¹ï¸ Commande ${orderId} : paiement ${status}, panier conservÃ© pour rÃ©essai`);
   } else {
-    console.log(`ℹ️ Commande ${orderId} : statut intermédiaire ${status}`);
+    console.log(`â„¹ï¸ Commande ${orderId} : statut intermÃ©diaire ${status}`);
   }
 }
 
@@ -511,14 +511,14 @@ async function handleOrderWebhook(status, metadata) {
 async function handleCampaignWebhook(status, metadata) {
   const { campaignId } = metadata;
   if (!campaignId) {
-    console.error('❌ Webhook campagne sans campaignId dans metadata');
+    console.error('âŒ Webhook campagne sans campaignId dans metadata');
     return;
   }
 
   const campaignRef = db.collection('campaigns').doc(campaignId);
   const campaignSnap = await campaignRef.get();
   if (!campaignSnap.exists) {
-    console.error(`❌ Webhook campagne introuvable: ${campaignId}`);
+    console.error(`âŒ Webhook campagne introuvable: ${campaignId}`);
     return;
   }
   const campaign = campaignSnap.data();
@@ -584,16 +584,16 @@ async function handleCampaignWebhook(status, metadata) {
       }
     }
 
-    console.log(`✅ Campagne ${campaignId} confirmee payee`);
+    console.log(`âœ… Campagne ${campaignId} confirmee payee`);
   } else if (['failed', 'cancelled', 'expired'].includes(status)) {
     await campaignRef.update({
       status: 'checkout_failed',
       paymentStatus: 'checkout_failed',
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
     });
-    console.log(`ℹ️ Campagne ${campaignId} : paiement ${status}`);
+    console.log(`â„¹ï¸ Campagne ${campaignId} : paiement ${status}`);
   } else {
-    console.log(`ℹ️ Campagne ${campaignId} : statut intermediaire ${status}`);
+    console.log(`â„¹ï¸ Campagne ${campaignId} : statut intermediaire ${status}`);
   }
 }
 
@@ -740,91 +740,211 @@ app.post('/escrow/release', async (req, res) => {
     if (!orderId || !pin) {
       return res.status(400).json({ error: 'orderId and pin required' });
     }
-
-    const orderRef = db.collection('orders').doc(orderId);
-    const orderSnap = await orderRef.get();
-    if (!orderSnap.exists) {
-      return res.status(404).json({ error: 'order not found' });
-    }
-    const order = orderSnap.data();
-
     const uid = decoded.uid;
-    let isAuthorized =
-      order.sellerId === uid ||
-      order.livreurId === uid ||
-      order.driverId === uid;
+    const orderRef = db.collection('orders').doc(orderId);
 
-    // BUG (signale par l'utilisateur 2026-09-05, corrige) : order.assignedDriverId
-    // est l'ID du document delivery_drivers (l'entree de flotte cote vendeur,
-    // cree via .add() dans le client), jamais egal a l'UID Firebase Auth reel
-    // du livreur -- cette comparaison directe ne pouvait donc jamais passer
-    // pour le livreur, qui se voyait rejete en permanence ("PIN incorrect")
-    // meme avec le bon code, l'obligeant a demander au vendeur de valider a
-    // sa place. On resout le vrai UID via le champ userId du document
-    // delivery_drivers correspondant (present pour un livreur "public",
-    // absent pour un livreur ajoute manuellement -- qui n'a de toute facon
-    // pas de compte pour appeler ce endpoint).
-    if (!isAuthorized && order.assignedDriverId) {
-      const fleetEntrySnap = await db
-        .collection('delivery_drivers')
-        .doc(order.assignedDriverId)
-        .get();
-      const fleetEntryUserId = fleetEntrySnap.exists
-        ? fleetEntrySnap.data().userId
-        : null;
-      isAuthorized = fleetEntryUserId === uid;
-    }
+    // D'abord, rAcupA"rer de maniA"re non-transactionnelle le delivery_driver si nAcessaire
+    // car cela ne mute pas et Aavite de charger la transaction avec une lecture statique.
+    let fleetEntryUserId = null;
+    let didFetchFleet = false;
+    
+    // On rAalise la logique mAatier au sein de la transaction Firestore.
+    const result = await db.runTransaction(async (t) => {
+      const orderSnap = await t.get(orderRef);
+      if (!orderSnap.exists) {
+        throw new Error('ORDER_NOT_FOUND');
+      }
+      const order = orderSnap.data();
 
-    if (!isAuthorized) {
-      return res.status(403).json({ error: 'not authorized for this order' });
-    }
+      // Authorization
+      let isAuthorized =
+        order.sellerId === uid ||
+        order.livreurId === uid ||
+        order.driverId === uid;
 
-    if (order.escrowStatus !== 'in_escrow') {
-      // Idempotence : si la commande est déjà marquée livrée ou l'escrow déjà libéré,
-      // et que le PIN concorde (ou si le PIN avait déjà été validé), on retourne
-      // un succès immédiat pour éviter l'erreur 409 lors d'une nouvelle tentative.
-      if (order.escrowStatus === 'released' || order.status === 'delivered') {
-        if (!order.customerPin || order.customerPin === pin) {
-          return res.json({ success: true, alreadyReleased: true });
+      if (!isAuthorized && order.assignedDriverId) {
+        if (!didFetchFleet) {
+          const fleetEntrySnap = await db.collection('delivery_drivers').doc(order.assignedDriverId).get();
+          fleetEntryUserId = fleetEntrySnap.exists ? fleetEntrySnap.data().userId : null;
+          didFetchFleet = true;
+        }
+        isAuthorized = fleetEntryUserId === uid;
+      }
+
+      if (!isAuthorized) {
+        throw new Error('NOT_AUTHORIZED');
+      }
+
+      // Verrou MAatier & Idempotence
+      if (order.escrowStatus !== 'in_escrow') {
+        if (order.escrowStatus === 'released' || order.status === 'delivered') {
+          if (!order.customerPin || order.customerPin === pin) {
+             throw new Error('ALREADY_RELEASED');
+          }
+        }
+        throw new Error('NOT_IN_ESCROW');
+      }
+
+      const paidStatuses = ['pay_on_delivery', 'test_mode_paid', 'completed'];
+      if (!paidStatuses.includes(order.paymentStatus)) {
+        throw new Error('PAYMENT_NOT_CONFIRMED');
+      }
+
+      if (!order.customerPin || order.customerPin !== pin) {
+        throw new Error('INVALID_PIN');
+      }
+
+      const escrowId = order.escrowId;
+      if (!escrowId) {
+        throw new Error('NO_ESCROW');
+      }
+      const escrowRef = db.collection('escrow').doc(escrowId);
+      const escrowSnap = await t.get(escrowRef);
+      if (!escrowSnap.exists) {
+        throw new Error('ESCROW_NOT_FOUND');
+      }
+      const escrow = escrowSnap.data();
+
+      // RAcquisitionner les rAcfArences produits pour dAccrAcmenter le stock
+      const items = order.items || [];
+      const productRefs = [];
+      const productSnaps = [];
+      for (const item of items) {
+        const productId = item.productId;
+        if (productId) {
+          const pRef = db.collection('products').doc(productId);
+          productRefs.push(pRef);
+          // On les lit dans la transaction pour Acviter les stock races
+          productSnaps.push(await t.get(pRef)); 
+        } else {
+          productRefs.push(null);
+          productSnaps.push(null);
         }
       }
-      return res.status(409).json({ error: 'order not in escrow' });
-    }
 
-    const paidStatuses = ['pay_on_delivery', 'test_mode_paid', 'completed'];
-    if (!paidStatuses.includes(order.paymentStatus)) {
-      return res.status(409).json({ error: 'payment not confirmed' });
-    }
+      // ----------------- WRITES -----------------
+      const now = admin.firestore.FieldValue.serverTimestamp();
 
-    if (!order.customerPin || order.customerPin !== pin) {
-      return res.json({ success: false });
-    }
+      // 1. Order + Escrow (Statuts finaux)
+      t.update(escrowRef, {
+        status: 'released',
+        pinValidatedAt: now,
+        releasedAt: now,
+      });
+      t.update(orderRef, {
+        escrowStatus: 'released',
+        status: 'delivered',
+        deliveryStatus: 'delivered',
+        escrowReleasedAt: now,
+        lastUpdated: now,
+      });
 
-    const escrowId = order.escrowId;
-    if (!escrowId) {
-      return res.status(409).json({ error: 'escrow not found for this order' });
-    }
+      // 2. Stock dAduction
+      const sellerId = order.sellerId || order.storeId;
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const pRef = productRefs[i];
+        const pSnap = productSnaps[i];
+        
+        if (!pRef || !pSnap.exists) continue;
+        
+        const orderedQty = Number(item.quantity) || 0;
+        if (orderedQty <= 0) continue;
 
-    const now = admin.firestore.FieldValue.serverTimestamp();
-    const batch = db.batch();
-    batch.update(db.collection('escrow').doc(escrowId), {
-      status: 'released',
-      pinValidatedAt: now,
-      releasedAt: now,
+        const data = pSnap.data();
+        const freshQty = Number(data.quantity) || 0;
+        // RAcgle mActier stricte: le stock comptable ne doit jamais Aatre nAcgatif.
+        const newQty = Math.max(0, freshQty - orderedQty);
+
+        t.update(pRef, {
+          quantity: newQty,
+          lastUpdated: now,
+        });
+
+        // 3. Stock History
+        const stockHistoryId = `${orderId}_${item.productId}`;
+        t.set(db.collection('stock_history').doc(stockHistoryId), {
+          productId: item.productId,
+          change: -orderedQty,
+          previousQty: freshQty,
+          newQty: newQty,
+          timestamp: now,
+          userId: sellerId,
+          type: 'sale'
+        });
+      }
+
+      // 4. Finances : Mouvements financiers sAcurisAcs (Seller, Driver, Commission)
+      const sellerAmount = Number(escrow.sellerAmount) || 0;
+      const driverAmount = Number(escrow.driverAmount) || 0;
+      const commissionAmount = Number(escrow.commissionAmount) || 0;
+      const finalDriverId = order.assignedDriverId || order.driverId || order.livreurId;
+
+      if (sellerId && sellerAmount > 0) {
+        t.set(db.collection('transactions').doc(`${escrowId}_seller`), {
+          userId: sellerId,
+          type: 'sale',
+          amount: sellerAmount,
+          orderId: orderId,
+          escrowId: escrowId,
+          status: 'completed',
+          description: 'Vente sAccurisAce (fonds dAcbloquAcs par code PIN)',
+          createdAt: now,
+        });
+      }
+
+      if (finalDriverId && driverAmount > 0) {
+        t.set(db.collection('transactions').doc(`${escrowId}_driver`), {
+          userId: finalDriverId,
+          type: 'delivery',
+          amount: driverAmount,
+          orderId: orderId,
+          escrowId: escrowId,
+          status: 'completed',
+          description: 'Frais de livraison (sAcquestre)',
+          createdAt: now,
+        });
+      }
+
+      if (commissionAmount > 0) {
+        t.set(db.collection('commissions').doc(`${escrowId}_commission`), {
+          orderId: orderId,
+          escrowId: escrowId,
+          amount: commissionAmount,
+          sellerId: sellerId,
+          sellerSubscription: escrow.sellerSubscription || 'mensuel',
+          status: 'earned',
+          createdAt: now,
+        });
+      }
+
+      // Note : L'Aapargne automatique (VaultService) et la progression (Ascension/GradeService)
+      // ne sont pas inclus ici car cela obligerait A des query() complexes et nAcessiterait 
+      // de dupliquer toute la logique Flutter en Node.js (ex: boucle sur 5 niveaux d'Ascension). 
+      // Ces effets secondaires "non-financiers stricts" (ou gamification) 
+      // devraient faire l'objet de Cloud Functions distinctes ou Aatre migracs plus tard.
+
+      return { success: true };
     });
-    batch.update(orderRef, {
-      escrowStatus: 'released',
-      status: 'delivered',
-      deliveryStatus: 'delivered',
-      escrowReleasedAt: now,
-      lastUpdated: now,
-    });
-    await batch.commit();
 
-    res.json({ success: true });
+    res.json(result);
+
   } catch (e) {
+    if (e.message === 'ALREADY_RELEASED') {
+       return res.json({ success: true, alreadyProcessed: true });
+    }
+    if (e.message === 'INVALID_PIN') {
+       return res.json({ success: false });
+    }
+    if (e.message === 'ORDER_NOT_FOUND') return res.status(404).json({ error: 'order not found' });
+    if (e.message === 'NOT_AUTHORIZED') return res.status(403).json({ error: 'not authorized for this order' });
+    if (e.message === 'NOT_IN_ESCROW') return res.status(409).json({ error: 'order not in escrow' });
+    if (e.message === 'PAYMENT_NOT_CONFIRMED') return res.status(409).json({ error: 'payment not confirmed' });
+    if (e.message === 'NO_ESCROW') return res.status(409).json({ error: 'escrow not found for this order' });
+    if (e.message === 'ESCROW_NOT_FOUND') return res.status(404).json({ error: 'escrow document not found' });
+
     console.error(e);
-    res.status(e.statusCode || 500).json({ error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -1029,36 +1149,36 @@ app.post('/ai/insights', async (req, res) => {
 
     const lang = ['anglais', 'espagnol'].includes(outputLanguage)
       ? outputLanguage
-      : 'français';
+      : 'franÃ§ais';
     const avgOrder = orderCount ? Number(grossRevenue) / Number(orderCount) : 0;
 
-    const systemPrompt = `Tu es un conseiller commercial expert pour les vendeurs sur W-Com (une plateforme e-commerce africaine). Tu dois analyser les données du vendeur et donner 3 à 5 conseils concrets, pratiques et personnalisés.
+    const systemPrompt = `Tu es un conseiller commercial expert pour les vendeurs sur W-Com (une plateforme e-commerce africaine). Tu dois analyser les donnÃ©es du vendeur et donner 3 Ã  5 conseils concrets, pratiques et personnalisÃ©s.
 
-Règles de formatage obligatoires :
-- Réponds **uniquement** en JSON, pas de texte en dehors
-- Le JSON doit être un tableau d'objets avec ces champs :
-  - "title" (chaîne de caractères, court, en ${lang})
-  - "desc" (chaîne de caractères, 1 à 2 phrases max, en ${lang})
-  - "color" (chaîne de caractères : "orange", "cyan", "yellow", "green", "purple", "red")
-  - "icon" (chaîne de caractères, nom d'icône Material Icons : lightbulb, warning, map, shopping_cart, star, attach_money, etc.)
+RÃ¨gles de formatage obligatoires :
+- RÃ©ponds **uniquement** en JSON, pas de texte en dehors
+- Le JSON doit Ãªtre un tableau d'objets avec ces champs :
+  - "title" (chaÃ®ne de caractÃ¨res, court, en ${lang})
+  - "desc" (chaÃ®ne de caractÃ¨res, 1 Ã  2 phrases max, en ${lang})
+  - "color" (chaÃ®ne de caractÃ¨res : "orange", "cyan", "yellow", "green", "purple", "red")
+  - "icon" (chaÃ®ne de caractÃ¨res, nom d'icÃ´ne Material Icons : lightbulb, warning, map, shopping_cart, star, attach_money, etc.)
 
-Exemple de réponse valide :
+Exemple de rÃ©ponse valide :
 [
   {"title": "Augmentez votre panier moyen", "desc": "Votre panier moyen est bas. Proposez des packs produits.", "color": "cyan", "icon": "shopping_cart"},
-  {"title": "Fidélisez vos clients", "desc": "Votre taux de fidélité est faible. Créez un programme de récompenses.", "color": "orange", "icon": "favorite"}
+  {"title": "FidÃ©lisez vos clients", "desc": "Votre taux de fidÃ©litÃ© est faible. CrÃ©ez un programme de rÃ©compenses.", "color": "orange", "icon": "favorite"}
 ]`;
 
-    const userPrompt = `Voici les données du vendeur :
-- Chiffre d'affaires total (période sélectionnée) : ${Number(grossRevenue || 0).toFixed(0)} FCFA
+    const userPrompt = `Voici les donnÃ©es du vendeur :
+- Chiffre d'affaires total (pÃ©riode sÃ©lectionnÃ©e) : ${Number(grossRevenue || 0).toFixed(0)} FCFA
 - Nombre de commandes : ${Number(orderCount || 0)}
 - Panier moyen : ${avgOrder.toFixed(0)} FCFA
 - Note moyenne de la boutique : ${storeRating || 0}/5
-- Taux de fidélité (clients qui ont acheté plusieurs fois) : ${Number(fidelity || 0).toFixed(0)}%
+- Taux de fidÃ©litÃ© (clients qui ont achetÃ© plusieurs fois) : ${Number(fidelity || 0).toFixed(0)}%
 - Nombre d'articles vendus : ${Number(totalItemsSold || 0)}
-- Catégorie la plus vendue : ${topCategoryName || ''} (${Number(topCategoryCount || 0)} articles)
-- Nombre de clients acquis (normalisé) : ${Number(acquisition || 0).toFixed(0)}%
+- CatÃ©gorie la plus vendue : ${topCategoryName || ''} (${Number(topCategoryCount || 0)} articles)
+- Nombre de clients acquis (normalisÃ©) : ${Number(acquisition || 0).toFixed(0)}%
 
-Donne 3 à 5 conseils personnalisés pour améliorer les ventes.`;
+Donne 3 Ã  5 conseils personnalisÃ©s pour amÃ©liorer les ventes.`;
 
     const nvidiaResponse = await fetch(
       'https://integrate.api.nvidia.com/v1/chat/completions',
@@ -1175,7 +1295,7 @@ app.post('/ai/repos-assistant', async (req, res) => {
                 const prefixRepos = `chat_media/repos/${uid}/`;
                 
                 if (!pid.startsWith(prefixEco) && !pid.startsWith(prefixRepos)) {
-                  console.error(`Tentative d'accès non autorisé au media ${pid} par l'UID ${uid}`);
+                  console.error(`Tentative d'accÃ¨s non autorisÃ© au media ${pid} par l'UID ${uid}`);
                   const err = new Error('UNAUTHORIZED_MEDIA'); err.statusCode = 403; throw err;
                 }
                 
@@ -1184,7 +1304,7 @@ app.post('/ai/repos-assistant', async (req, res) => {
                   const err = new Error('INVALID_ASSET_NAME'); err.statusCode = 400; throw err;
                 }
 
-                // 2. Fetch sécurisé et gestion des erreurs Cloudinary (Fail-Closed sans falsifier le prompt)
+                // 2. Fetch sÃ©curisÃ© et gestion des erreurs Cloudinary (Fail-Closed sans falsifier le prompt)
                 try {
                   const url = cloudinary.url(pid, {
                     type: 'authenticated',
@@ -1354,15 +1474,15 @@ app.post('/ai/repos-assistant', async (req, res) => {
             productId: doc.id,
             productName: name,
             reason: 'Stock dormant (aucune vente depuis 30 jours)',
-            suggestion: 'Créer une promotion ciblée (-15%)'
+            suggestion: 'CrÃ©er une promotion ciblÃ©e (-15%)'
           });
         }
       } else if (salesLast30Days >= 10) {
         smartPricing.push({
           productId: doc.id,
           productName: name,
-          reason: `Produit très demandé (${salesLast30Days} ventes ces 30 derniers jours)`,
-          suggestion: 'Augmenter légèrement le prix (+5%)'
+          reason: `Produit trÃ¨s demandÃ© (${salesLast30Days} ventes ces 30 derniers jours)`,
+          suggestion: 'Augmenter lÃ©gÃ¨rement le prix (+5%)'
         });
       }
     }
@@ -1371,7 +1491,7 @@ app.post('/ai/repos-assistant', async (req, res) => {
     
     const recentOrders = recentOrdersDocs.map(doc => {
       const data = doc.data();
-      return `- Commande ID=${doc.id}, Client=${data.customerName || 'Inconnu'}, Total=${Number(data.totalAmount)||0} CFA, Statut=${data.status||'pending'}, Livreur=${data.livreurName||'Non assigné'}`;
+      return `- Commande ID=${doc.id}, Client=${data.customerName || 'Inconnu'}, Total=${Number(data.totalAmount)||0} CFA, Statut=${data.status||'pending'}, Livreur=${data.livreurName||'Non assignÃ©'}`;
     }).join("\n");
 
     const actualDrivers = driversSnap.empty ? driversBySellerSnap.docs : driversSnap.docs;
@@ -1382,24 +1502,24 @@ app.post('/ai/repos-assistant', async (req, res) => {
 
     const storeContext = `CONTEXTE BOUTIQUE :
 - Nom : ${storeData.storeName || 'Ma Boutique'}
-- Catégorie : ${storeData.category || 'Général'}
-- Ville : ${storeData.commune || 'Non spécifiée'}
+- CatÃ©gorie : ${storeData.category || 'GÃ©nÃ©ral'}
+- Ville : ${storeData.commune || 'Non spÃ©cifiÃ©e'}
 - Note : ${Number(storeData.averageRating)||0}/5 (${Number(storeData.reviewCount)||0} avis)
 
 PERFORMANCES GLOBALES (30 JOURS) :
 - CA Total : ${totalRevenue.toFixed(0)} CFA
 - Commandes : ${totalOrders}
 
-CATALOGUE DÉTAILLÉ (Prix, Stocks et Ventes) :
+CATALOGUE DÃ‰TAILLÃ‰ (Prix, Stocks et Ventes) :
 ${detailedProducts.map(p => `- ${p.nom} : ID=${p.id}, Prix=${p.prix} CFA, Stock=${p.stock_actuel}, Ventes=${p.ventes_30j}, CA=${p.ca_30j} CFA`).join("\n")}
 
-COMMANDES RÉCENTES (10 dernières) :
+COMMANDES RÃ‰CENTES (10 derniÃ¨res) :
 ${recentOrders}
 
 LISTE DES LIVREURS :
 ${availableDrivers}
 
-AVIS RÉCENTS :
+AVIS RÃ‰CENTS :
 ${recentReviews}`;
 
     const insightsText = JSON.stringify({
@@ -1432,50 +1552,50 @@ YOUR NEW AUTONOMOUS CAPABILITIES:
 RULES:
 - Be PROACTIVE. Mention alerts without being asked.
 - Always reply in English.`;
-    } else if (language === "Español") {
-      systemPrompt = `Eres Repos, el asistente de comercio electrónico autónomo y proactivo de W-COM.
+    } else if (language === "EspaÃ±ol") {
+      systemPrompt = `Eres Repos, el asistente de comercio electrÃ³nico autÃ³nomo y proactivo de W-COM.
 [DATOS DE TIENDA]
 ${storeContext}
-[INFORMACIÓN INTELIGENTE (JSON)]
+[INFORMACIÃ“N INTELIGENTE (JSON)]
 ${insightsText}
-TUS NUEVAS CAPACIDADES AUTÓNOMAS:
-1. Previsión de stock: Analiza 'stockAlerts' para prevenir la falta de stock.
+TUS NUEVAS CAPACIDADES AUTÃ“NOMAS:
+1. PrevisiÃ³n de stock: Analiza 'stockAlerts' para prevenir la falta de stock.
 2. Smart Pricing: Utiliza 'smartPricing' para sugerir promociones dirigidas en inventario inactivo o sugerir aumentar los precios ligeramente.
 3. Briefing: Utiliza 'dailyBriefing' para resumir el rendimiento.
-4. Campaña de Marketing: Analiza 'inactiveClientsCount'. Si > 0, propone proactivamente enviar una campaña.
-5. ACCIONES DE EDICIÓN (MUY IMPORTANTE):
-   Utiliza el formato especial [ACTION:TYPE:ID:VALUE] en tu respuesta para activar la ejecución:
+4. CampaÃ±a de Marketing: Analiza 'inactiveClientsCount'. Si > 0, propone proactivamente enviar una campaÃ±a.
+5. ACCIONES DE EDICIÃ“N (MUY IMPORTANTE):
+   Utiliza el formato especial [ACTION:TYPE:ID:VALUE] en tu respuesta para activar la ejecuciÃ³n:
    - Precio: [ACTION:UPDATE_PRICE:productId:nuevo_precio]
    - Stock: [ACTION:UPDATE_STOCK:productId:nuevo_stock]
-   - Descripción: [ACTION:UPDATE_DESC:productId:nueva_descripcion]
+   - DescripciÃ³n: [ACTION:UPDATE_DESC:productId:nueva_descripcion]
    - Estado del pedido: [ACTION:UPDATE_ORDER_STATUS:orderId:nuevo_estado]
    - Asignar repartidor: [ACTION:ASSIGN_DRIVER:orderId:driverId:nombreRepartidor]
-   - Enviar campaña: [ACTION:SEND_CAMPAIGN:descuento:códigoPromo]
+   - Enviar campaÃ±a: [ACTION:SEND_CAMPAIGN:descuento:cÃ³digoPromo]
 REGLAS:
-- Sé PROACTIVO. Si ves una alerta, menciónala.
-- Responde siempre en Español.`;
+- SÃ© PROACTIVO. Si ves una alerta, menciÃ³nala.
+- Responde siempre en EspaÃ±ol.`;
     } else {
       systemPrompt = `Tu es Repos, l'assistant e-commerce autonome et proactif de W-COM.
-[DONNÉES BOUTIQUE]
+[DONNÃ‰ES BOUTIQUE]
 ${storeContext}
 [INSIGHTS INTELLIGENTS (JSON)]
 ${insightsText}
-TES NOUVELLES CAPACITÉS AUTONOMES :
-1. Prévision de stock : Analyse 'stockAlerts' pour prévenir des ruptures.
-2. Smart Pricing : Utilise 'smartPricing' pour suggérer de créer des promotions sur les stocks dormants ou d'augmenter le prix.
+TES NOUVELLES CAPACITÃ‰S AUTONOMES :
+1. PrÃ©vision de stock : Analyse 'stockAlerts' pour prÃ©venir des ruptures.
+2. Smart Pricing : Utilise 'smartPricing' pour suggÃ©rer de crÃ©er des promotions sur les stocks dormants ou d'augmenter le prix.
 3. Briefing : Utilise 'dailyBriefing'.
 4. Campagne Marketing : Analyse 'inactiveClientsCount'. Si > 0, propose d'envoyer une campagne.
-5. ACTIONS DE MODIFICATION (TRÈS IMPORTANT) :
-   Utilise le format [ACTION:TYPE:ID:VALEUR] dans ta réponse :
+5. ACTIONS DE MODIFICATION (TRÃˆS IMPORTANT) :
+   Utilise le format [ACTION:TYPE:ID:VALEUR] dans ta rÃ©ponse :
    - Prix : [ACTION:UPDATE_PRICE:productId:nouveau_prix]
    - Stock : [ACTION:UPDATE_STOCK:productId:nouveau_stock]
    - Description : [ACTION:UPDATE_DESC:productId:nouvelle_description]
    - Statut Commande : [ACTION:UPDATE_ORDER_STATUS:orderId:nouveau_statut]
    - Assigner Livreur : [ACTION:ASSIGN_DRIVER:orderId:driverId:nomLivreur]
    - Envoyer Campagne : [ACTION:SEND_CAMPAIGN:remise:codePromo]
-RÈGLES :
+RÃˆGLES :
 - Sois PROACTIF.
-- Réponds toujours en Français.`;
+- RÃ©ponds toujours en FranÃ§ais.`;
     }
 
     const messagesForApi = [
@@ -1487,7 +1607,7 @@ RÈGLES :
        messagesForApi.push({
          role: "user",
          content: [
-           { type: "text", text: (language === "English" ? "Here is the image to analyze:" : "Voici l'image à analyser :") },
+           { type: "text", text: (language === "English" ? "Here is the image to analyze:" : "Voici l'image Ã  analyser :") },
            { type: "image_url", image_url: { url: image.startsWith("data:") ? image : `data:image/jpeg;base64,${image}` } }
          ]
        });
@@ -1571,13 +1691,13 @@ app.post('/ai/product-content', async (req, res) => {
 
         if (language && (language.toLowerCase().startsWith('fran') || language.toLowerCase() === 'french')) language = 'French';
     if (language && (language.toLowerCase().startsWith('anglais') || language.toLowerCase() === 'english')) language = 'English';
-    const ALLOWED_LANGUAGES = new Set(['French', 'English', 'Español']);
+    const ALLOWED_LANGUAGES = new Set(['French', 'English', 'EspaÃ±ol']);
     if (language == null) {
       language = 'French';
-    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'Español' && !language.startsWith('Espa')) {
+    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'EspaÃ±ol' && !language.startsWith('Espa')) {
       return res.status(400).json({ error: 'invalid language' });
     }
-    if (language && language.startsWith('Espa')) language = 'Español';
+    if (language && language.startsWith('Espa')) language = 'EspaÃ±ol';
 
     let systemPrompt = "";
     let userPrompt = "";
@@ -1605,12 +1725,12 @@ app.post('/ai/product-content', async (req, res) => {
       if (language === 'English') {
         systemPrompt = "You are an e-commerce assistant who writes precise, natural and useful product descriptions.";
         userPrompt = `Write a compelling product description in English for an Ivorian marketplace.\nProduct: ${safeName}\nCategory: ${safeCategory}\nPrice: ${safePrice}\nStock: ${safeStock || 'unspecified'}\nConstraints: 70 to 110 words, professional and warm tone, no emojis, no impossible promises, end with a short call to action.`;
-      } else if (language === 'Español') {
-        systemPrompt = "Eres un asistente de comercio electrónico que escribe descripciones de productos precisas, naturales y útiles.";
-        userPrompt = `Redacta una descripción de producto atractiva en español para un mercado marfileño.\nProducto: ${safeName}\nCategoría: ${safeCategory}\nPrecio: ${safePrice}\nStock: ${safeStock || 'no especificado'}\nRestricciones: 70 a 110 palabras, tono profesional y cálido, sin emojis, sin promesas imposibles, termina con una llamada a la acción corta.`;
+      } else if (language === 'EspaÃ±ol') {
+        systemPrompt = "Eres un asistente de comercio electrÃ³nico que escribe descripciones de productos precisas, naturales y Ãºtiles.";
+        userPrompt = `Redacta una descripciÃ³n de producto atractiva en espaÃ±ol para un mercado marfileÃ±o.\nProducto: ${safeName}\nCategorÃ­a: ${safeCategory}\nPrecio: ${safePrice}\nStock: ${safeStock || 'no especificado'}\nRestricciones: 70 a 110 palabras, tono profesional y cÃ¡lido, sin emojis, sin promesas imposibles, termina con una llamada a la acciÃ³n corta.`;
       } else {
-        systemPrompt = "Tu es un assistant e-commerce qui écrit des descriptions produit précises, naturelles et utiles.";
-        userPrompt = `Rédige une description produit vendeuse en français pour une marketplace ivoirienne.\nProduit: ${safeName}\nCatégorie: ${safeCategory}\nPrix: ${safePrice}\nStock: ${safeStock || 'non précisé'}\nContraintes: 70 à 110 mots, ton professionnel et chaleureux, pas d'emojis, pas de promesses impossibles, termine par un appel à l'action court.`;
+        systemPrompt = "Tu es un assistant e-commerce qui Ã©crit des descriptions produit prÃ©cises, naturelles et utiles.";
+        userPrompt = `RÃ©dige une description produit vendeuse en franÃ§ais pour une marketplace ivoirienne.\nProduit: ${safeName}\nCatÃ©gorie: ${safeCategory}\nPrix: ${safePrice}\nStock: ${safeStock || 'non prÃ©cisÃ©'}\nContraintes: 70 Ã  110 mots, ton professionnel et chaleureux, pas d'emojis, pas de promesses impossibles, termine par un appel Ã  l'action court.`;
       }
       
       maxTokens = 220;
@@ -1658,7 +1778,7 @@ app.post('/ai/product-content', async (req, res) => {
         }
       }
 
-      const noDescText = language === 'English' ? 'No description' : (language === 'Español' ? 'Sin descripción' : 'Pas de description');
+      const noDescText = language === 'English' ? 'No description' : (language === 'EspaÃ±ol' ? 'Sin descripciÃ³n' : 'Pas de description');
       const productsInfoList = productDocs.map(doc => {
         const p = doc.data();
         const priceCfa = p.price != null ? `${p.price} CFA` : '';
@@ -1669,12 +1789,12 @@ app.post('/ai/product-content', async (req, res) => {
       if (language === 'English') {
         systemPrompt = "You are a renowned e-commerce literary writer (named Repos) specialized in storytelling for fashion and craft collections.";
         userPrompt = `Write a captivating and immersive narrative story in English to present these products in a Lookbook / Fashion-Beauty-Style Editorial.\nProducts:\n${productsInfoList}\n\nConstraints:\n- Length: 150 to 250 words.\n- Immersive and poetic tone, like a creator's blog or a Wattpad chapter.\n- No emojis, weave in beautiful metaphors around these pieces.\n- Make clear paragraphs separated by line breaks.`;
-      } else if (language === 'Español') {
-        systemPrompt = "Eres un reconocido escritor literario de comercio electrónico (llamado Repos) especializado en storytelling de colecciones de moda y artesanía.";
-        userPrompt = `Redacta una historia narrativa cautivadora e inmersiva en español para presentar estos productos en un Lookbook / Editorial de moda/belleza/estilo.\nProductos:\n${productsInfoList}\n\nRestricciones:\n- Longitud: 150 a 250 palabras.\n- Tono inmersivo y poético, tipo blog de creador o capítulo de Wattpad.\n- Sin emojis, incorpora hermosas metáforas alrededor de estas piezas.\n- Haz párrafos claros separados por saltos de línea.`;
+      } else if (language === 'EspaÃ±ol') {
+        systemPrompt = "Eres un reconocido escritor literario de comercio electrÃ³nico (llamado Repos) especializado en storytelling de colecciones de moda y artesanÃ­a.";
+        userPrompt = `Redacta una historia narrativa cautivadora e inmersiva en espaÃ±ol para presentar estos productos en un Lookbook / Editorial de moda/belleza/estilo.\nProductos:\n${productsInfoList}\n\nRestricciones:\n- Longitud: 150 a 250 palabras.\n- Tono inmersivo y poÃ©tico, tipo blog de creador o capÃ­tulo de Wattpad.\n- Sin emojis, incorpora hermosas metÃ¡foras alrededor de estas piezas.\n- Haz pÃ¡rrafos claros separados por saltos de lÃ­nea.`;
       } else {
-        systemPrompt = "Tu es un rédacteur littéraire e-commerce de renom (nommé Repos) spécialisé dans le storytelling de collections de mode et d'artisanat.";
-        userPrompt = `Rédige une histoire narrative captivante et immersive en français pour présenter ces produits dans un Lookbook / Éditorial de mode/beauté/style.\nProduits :\n${productsInfoList}\n\nContraintes :\n- Longueur: 150 à 250 mots.\n- Ton immersif et poétique, type blog de créateur ou chapitre Wattpad.\n- Pas d'emojis, intègre de magnifiques métaphores autour de ces pièces.\n- Fais des paragraphes clairs espacés par des sauts de ligne.`;
+        systemPrompt = "Tu es un rÃ©dacteur littÃ©raire e-commerce de renom (nommÃ© Repos) spÃ©cialisÃ© dans le storytelling de collections de mode et d'artisanat.";
+        userPrompt = `RÃ©dige une histoire narrative captivante et immersive en franÃ§ais pour prÃ©senter ces produits dans un Lookbook / Ã‰ditorial de mode/beautÃ©/style.\nProduits :\n${productsInfoList}\n\nContraintes :\n- Longueur: 150 Ã  250 mots.\n- Ton immersif et poÃ©tique, type blog de crÃ©ateur ou chapitre Wattpad.\n- Pas d'emojis, intÃ¨gre de magnifiques mÃ©taphores autour de ces piÃ¨ces.\n- Fais des paragraphes clairs espacÃ©s par des sauts de ligne.`;
       }
 
       maxTokens = 500;
@@ -1733,8 +1853,8 @@ app.post('/ai/product-content', async (req, res) => {
 });
 
 // ---------------------------
-// Endpoint d�di� sp�cifique pour le Marketing (Phase 1G.4.2)
-// S�curis� : Authentification, Validation stricte des inputs, Mod�le et Prompt serveur
+// Endpoint dï¿½diï¿½ spï¿½cifique pour le Marketing (Phase 1G.4.2)
+// Sï¿½curisï¿½ : Authentification, Validation stricte des inputs, Modï¿½le et Prompt serveur
 // ---------------------------
 const marketingRateLimits = new Map();
 
@@ -1758,7 +1878,7 @@ app.post('/ai/marketing', async (req, res) => {
 
     const { operation, language = 'French' } = req.body;
     
-    if (!['French', 'English', 'Espa�ol'].includes(language)) {
+    if (!['French', 'English', 'Espaï¿½ol'].includes(language)) {
       return res.status(400).json({ error: 'invalid_language' });
     }
 
@@ -1786,18 +1906,18 @@ app.post('/ai/marketing', async (req, res) => {
           systemPrompt = `You are a digital marketing expert for e-commerce in Ivory Coast.\nGenerate 3 variants of WhatsApp status with tone "${safeTone}": one short and punchy, one narrative/emotional, and one aggressive flash-sale style.`;
         }
         userPrompt = `Product: ${productName}\nLocation: ${safeCity}\nOptions: Emojis=${emojis}, Hashtags=${hashtags}, CTA=${cta}, Promo=${promo}, Location=${location}\n\nRespond ONLY with a JSON array of 3 strings, one per line, without markdown.`;
-      } else if (language === 'Espa�ol') {
-        systemPrompt = `Eres un experto en marketing digital para el comercio electr�nico en Costa de Marfil.\nGenera 3 variantes de captions para ${platform} con el tono "${safeTone}".`;
+      } else if (language === 'Espaï¿½ol') {
+        systemPrompt = `Eres un experto en marketing digital para el comercio electrï¿½nico en Costa de Marfil.\nGenera 3 variantes de captions para ${platform} con el tono "${safeTone}".`;
         if (platform.toLowerCase().includes('whatsapp status') || platform.toLowerCase() === 'whatsapp') {
-          systemPrompt = `Eres un experto en marketing digital para el comercio electr�nico en Costa de Marfil.\nGenera 3 variantes de estado de WhatsApp con el tono "${safeTone}": una corta e impactante, una narrativa/emotiva, y una agresiva estilo venta flash.`;
+          systemPrompt = `Eres un experto en marketing digital para el comercio electrï¿½nico en Costa de Marfil.\nGenera 3 variantes de estado de WhatsApp con el tono "${safeTone}": una corta e impactante, una narrativa/emotiva, y una agresiva estilo venta flash.`;
         }
-        userPrompt = `Producto: ${productName}\nUbicaci�n: ${safeCity}\nOpciones: Emojis=${emojis}, Hashtags=${hashtags}, CTA=${cta}, Promo=${promo}, Ubicaci�n=${location}\n\nResponde �NICAMENTE con un array JSON de 3 strings, uno por l�nea, sin markdown.`;
+        userPrompt = `Producto: ${productName}\nUbicaciï¿½n: ${safeCity}\nOpciones: Emojis=${emojis}, Hashtags=${hashtags}, CTA=${cta}, Promo=${promo}, Ubicaciï¿½n=${location}\n\nResponde ï¿½NICAMENTE con un array JSON de 3 strings, uno por lï¿½nea, sin markdown.`;
       } else {
-        systemPrompt = `Tu es un expert en marketing digital pour le e-commerce en C�te d'Ivoire.\nG�n�re 3 variantes de captions pour ${platform} avec le ton "${safeTone}".`;
+        systemPrompt = `Tu es un expert en marketing digital pour le e-commerce en Cï¿½te d'Ivoire.\nGï¿½nï¿½re 3 variantes de captions pour ${platform} avec le ton "${safeTone}".`;
         if (platform.toLowerCase().includes('whatsapp status') || platform.toLowerCase() === 'whatsapp') {
-          systemPrompt = `Tu es un expert en marketing digital pour le e-commerce en C�te d'Ivoire.\nG�n�re 3 variantes de statut WhatsApp avec le ton "${safeTone}" : une courte et percutante, une storytelling/�motive, une agressive style vente flash.`;
+          systemPrompt = `Tu es un expert en marketing digital pour le e-commerce en Cï¿½te d'Ivoire.\nGï¿½nï¿½re 3 variantes de statut WhatsApp avec le ton "${safeTone}" : une courte et percutante, une storytelling/ï¿½motive, une agressive style vente flash.`;
         }
-        userPrompt = `Produit : ${productName}\nLocalisation : ${safeCity}\nOptions : Emojis=${emojis}, Hashtags=${hashtags}, CTA=${cta}, Promo=${promo}, Mention localisation=${location}\n\nR�ponds UNIQUEMENT avec un JSON array de 3 strings, une par ligne, sans markdown.`;
+        userPrompt = `Produit : ${productName}\nLocalisation : ${safeCity}\nOptions : Emojis=${emojis}, Hashtags=${hashtags}, CTA=${cta}, Promo=${promo}, Mention localisation=${location}\n\nRï¿½ponds UNIQUEMENT avec un JSON array de 3 strings, une par ligne, sans markdown.`;
       }
 
     } else if (operation === 'campaign') {
@@ -1807,19 +1927,19 @@ app.post('/ai/marketing', async (req, res) => {
       if (typeof campaignName !== 'string' || campaignName.length > 100) return res.status(400).json({ error: 'invalid_campaignName' });
       
       const safeProductNames = (typeof productNames === 'string') ? productNames.substring(0, 300) : 'divers produits';
-      const ctaWhatsAppFr = channel.toLowerCase() === 'whatsapp' ? "Inclus un appel � l'action pour contacter le vendeur et commander." : "";
+      const ctaWhatsAppFr = channel.toLowerCase() === 'whatsapp' ? "Inclus un appel ï¿½ l'action pour contacter le vendeur et commander." : "";
       const ctaWhatsAppEn = channel.toLowerCase() === 'whatsapp' ? "Include a call to action to contact the seller and order." : "";
-      const ctaWhatsAppEs = channel.toLowerCase() === 'whatsapp' ? "Incluye una llamada a la acci�n para escribir al vendedor y pedir." : "";
+      const ctaWhatsAppEs = channel.toLowerCase() === 'whatsapp' ? "Incluye una llamada a la acciï¿½n para escribir al vendedor y pedir." : "";
       
       if (language === 'English') {
         systemPrompt = `You are a digital marketing expert for e-commerce in Ivory Coast.\nGenerate 3 short variants of marketing messages for a "${channel}" campaign named "${campaignName}".`;
         userPrompt = `Featured products: ${safeProductNames}\n${ctaWhatsAppEn}\n\nRespond ONLY with a JSON array of 3 strings, without markdown.`;
-      } else if (language === 'Espa�ol') {
-        systemPrompt = `Eres un experto en marketing digital para el comercio electr�nico en Costa de Marfil.\nGenera 3 variantes cortas de mensajes de marketing para una campa�a "${channel}" llamada "${campaignName}".`;
-        userPrompt = `Productos destacados: ${safeProductNames}\n${ctaWhatsAppEs}\n\nResponde �NICAMENTE con un array JSON de 3 strings, sin markdown.`;
+      } else if (language === 'Espaï¿½ol') {
+        systemPrompt = `Eres un experto en marketing digital para el comercio electrï¿½nico en Costa de Marfil.\nGenera 3 variantes cortas de mensajes de marketing para una campaï¿½a "${channel}" llamada "${campaignName}".`;
+        userPrompt = `Productos destacados: ${safeProductNames}\n${ctaWhatsAppEs}\n\nResponde ï¿½NICAMENTE con un array JSON de 3 strings, sin markdown.`;
       } else {
-        systemPrompt = `Tu es un expert en marketing digital pour le e-commerce en C�te d'Ivoire.\nG�n�re 3 variantes courtes de messages marketing pour une campagne "${channel}" nomm�e "${campaignName}".`;
-        userPrompt = `Produits mis en avant : ${safeProductNames}\n${ctaWhatsAppFr}\n\nR�ponds UNIQUEMENT avec un JSON array de 3 strings, sans markdown.`;
+        systemPrompt = `Tu es un expert en marketing digital pour le e-commerce en Cï¿½te d'Ivoire.\nGï¿½nï¿½re 3 variantes courtes de messages marketing pour une campagne "${channel}" nommï¿½e "${campaignName}".`;
+        userPrompt = `Produits mis en avant : ${safeProductNames}\n${ctaWhatsAppFr}\n\nRï¿½ponds UNIQUEMENT avec un JSON array de 3 strings, sans markdown.`;
       }
     } else {
       return res.status(400).json({ error: 'invalid_operation' });
@@ -1955,30 +2075,30 @@ app.post('/ai/summarize-chat', async (req, res) => {
 
         if (language && (language.toLowerCase().startsWith('fran') || language.toLowerCase() === 'french')) language = 'French';
     if (language && (language.toLowerCase().startsWith('anglais') || language.toLowerCase() === 'english')) language = 'English';
-    const ALLOWED_LANGUAGES = new Set(['French', 'English', 'Español']);
+    const ALLOWED_LANGUAGES = new Set(['French', 'English', 'EspaÃ±ol']);
     if (language == null) {
       language = 'French';
-    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'Español' && !language.startsWith('Espa')) {
+    } else if (!ALLOWED_LANGUAGES.has(language) && language !== 'EspaÃ±ol' && !language.startsWith('Espa')) {
       return res.status(400).json({ error: 'Invalid language' });
     }
-    if (language && language.startsWith('Espa')) language = 'Español';
+    if (language && language.startsWith('Espa')) language = 'EspaÃ±ol';
 
     let systemPrompt = "";
     if (type === 'customer') {
       if (language === 'English') {
         systemPrompt = "You are the AI assistant of W-COM. Summarize this commercial conversation in 2 to 3 sentences. Highlight the main intent, important requests, and useful elements for the seller. Be factual and concise. Do not create any information not present in the conversation.";
-      } else if (language === 'Español') {
-        systemPrompt = "Eres el asistente de IA de W-COM. Resume esta conversación comercial en 2 a 3 oraciones. Destaca la intención principal, las solicitudes importantes y los elementos útiles para el vendedor. Sé factual y conciso. No crees información que no esté en la conversación.";
+      } else if (language === 'EspaÃ±ol') {
+        systemPrompt = "Eres el asistente de IA de W-COM. Resume esta conversaciÃ³n comercial en 2 a 3 oraciones. Destaca la intenciÃ³n principal, las solicitudes importantes y los elementos Ãºtiles para el vendedor. SÃ© factual y conciso. No crees informaciÃ³n que no estÃ© en la conversaciÃ³n.";
       } else {
-        systemPrompt = "Tu es l'assistant IA de W-COM. Résume cette conversation commerciale en 2 à 3 phrases. Mets en évidence l'intention principale, les demandes importantes et les éléments utiles pour le vendeur. Reste factuel et concis. Ne crée aucune information absente de la conversation.";
+        systemPrompt = "Tu es l'assistant IA de W-COM. RÃ©sume cette conversation commerciale en 2 Ã  3 phrases. Mets en Ã©vidence l'intention principale, les demandes importantes et les Ã©lÃ©ments utiles pour le vendeur. Reste factuel et concis. Ne crÃ©e aucune information absente de la conversation.";
       }
     } else if (type === 'workspace') {
       if (language === 'English') {
         systemPrompt = "You are the AI assistant of W-COM Workspace. Summarize this professional conversation in 2 to 3 sentences. Highlight decisions, problems, important requests, and next actions when explicitly present. Be factual and concise. Do not create any information not present in the conversation.";
-      } else if (language === 'Español') {
-        systemPrompt = "Eres el asistente de IA de W-COM Workspace. Resume esta conversación profesional en 2 a 3 oraciones. Destaca decisiones, problemas, solicitudes importantes y próximos pasos cuando estén explícitamente presentes. Sé factual y conciso. No crees información que no esté en la conversación.";
+      } else if (language === 'EspaÃ±ol') {
+        systemPrompt = "Eres el asistente de IA de W-COM Workspace. Resume esta conversaciÃ³n profesional en 2 a 3 oraciones. Destaca decisiones, problemas, solicitudes importantes y prÃ³ximos pasos cuando estÃ©n explÃ­citamente presentes. SÃ© factual y conciso. No crees informaciÃ³n que no estÃ© en la conversaciÃ³n.";
       } else {
-        systemPrompt = "Tu es l'assistant IA de W-COM Workspace. Résume cette conversation professionnelle en 2 à 3 phrases. Mets en évidence les décisions, problèmes, demandes importantes et prochaines actions lorsqu'elles sont explicitement présentes. Reste factuel et concis. Ne crée aucune information absente de la conversation.";
+        systemPrompt = "Tu es l'assistant IA de W-COM Workspace. RÃ©sume cette conversation professionnelle en 2 Ã  3 phrases. Mets en Ã©vidence les dÃ©cisions, problÃ¨mes, demandes importantes et prochaines actions lorsqu'elles sont explicitement prÃ©sentes. Reste factuel et concis. Ne crÃ©e aucune information absente de la conversation.";
       }
     }
 
@@ -2191,6 +2311,751 @@ INSTRUCTIONS IMPORTANTES :
 // flash_sale_screen.dart avant ce correctif), mais ferme l'exposition totale
 // et anonyme de la cle qui permettait de le faire sans meme avoir de compte.
 // ---------------------------
+const riskAlertRateLimits = new Map();
+
+// Helper geographique (Haversine)
+function getDistanceMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371e3; // metres
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+            Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+
+// ============================================================
+// PHASE 2.2.1-B-C7-C7-D : GET /api/drivers/nearby
+// Remplacement du calcul GPS local Flutter. Expose uniquement
+// les donnees operationnelles (driver_availability) et calcule
+// la distance serveur via le GPS prive (public_drivers).
+// ============================================================
+const nearbyDriversRateLimits = new Map();
+
+app.get('/api/drivers/nearby', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
+
+    // Rate Limit: 20 requetes / minute / UID
+    const now = Date.now();
+    const rateData = nearbyDriversRateLimits.get(uid) || { count: 0, resetTime: now + 60000 };
+    if (now > rateData.resetTime) {
+      rateData.count = 0;
+      rateData.resetTime = now + 60000;
+    }
+    rateData.count++;
+    nearbyDriversRateLimits.set(uid, rateData);
+
+    if (rateData.count > 20) {
+      return res.status(429).json({ error: 'rate_limit_exceeded', message: 'Too many nearby requests' });
+    }
+
+    // 1. Validation des parametres
+    // Par defaut: centre d'Abidjan (comportement routes_screen.dart actuel)
+    const lat = req.query.lat !== undefined ? parseFloat(req.query.lat) : 5.3600;
+    const lng = req.query.lng !== undefined ? parseFloat(req.query.lng) : -4.0083;
+    const radiusKm = req.query.radiusKm !== undefined ? parseFloat(req.query.radiusKm) : 5;
+
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90) {
+      return res.status(400).json({ error: 'invalid_lat' });
+    }
+    if (!Number.isFinite(lng) || lng < -180 || lng > 180) {
+      return res.status(400).json({ error: 'invalid_lng' });
+    }
+    if (!Number.isFinite(radiusKm) || radiusKm <= 0 || radiusKm > 10) {
+      return res.status(400).json({ error: 'invalid_radius' });
+    }
+
+    // 2. Source OpArationnelle: driver_availability
+    const availabilitySnap = await db.collection('driver_availability')
+      .where('isAvailable', '==', true)
+      .where('status', '==', 'active')
+      .get();
+
+    const operationalDrivers = [];
+    availabilitySnap.forEach(doc => {
+      operationalDrivers.push({ id: doc.id, ...doc.data() });
+    });
+
+    if (operationalDrivers.length === 0) {
+      return res.status(200).json({ drivers: [] });
+    }
+
+    // 3. RAccupAcration GPS Prive (server-side ONLY)
+    // Chunking par 30 pour la limite Firestore de whereIn
+    const gpsDataMap = new Map();
+    const uids = operationalDrivers.map(d => d.id);
+    
+    for (let i = 0; i < uids.length; i += 30) {
+      const chunk = uids.slice(i, i + 30);
+      const gpsSnap = await db.collection('public_drivers')
+        .where('__name__', 'in', chunk)
+        .get();
+        
+      gpsSnap.forEach(doc => {
+        const data = doc.data();
+        if (
+          typeof data.lastLat === 'number' && typeof data.lastLng === 'number' &&
+          Number.isFinite(data.lastLat) && Number.isFinite(data.lastLng) &&
+          data.lastLat >= -90 && data.lastLat <= 90 &&
+          data.lastLng >= -180 && data.lastLng <= 180 &&
+          !(data.lastLat === 0 && data.lastLng === 0)
+        ) {
+          gpsDataMap.set(doc.id, { lat: data.lastLat, lng: data.lastLng });
+        }
+      });
+    }
+
+    // 4. Calcul Haversine, Filtrage et Tri
+    const driversWithDistance = [];
+    for (const driver of operationalDrivers) {
+      const gps = gpsDataMap.get(driver.id);
+      if (!gps) continue;
+
+      const distanceMeters = getDistanceMeters(lat, lng, gps.lat, gps.lng);
+      const distanceKm = distanceMeters / 1000;
+
+      if (distanceKm <= radiusKm) {
+        const responseDriver = {
+          userId: driver.userId || driver.id,
+          name: driver.name || 'Livreur',
+          vehicleType: driver.vehicleType || 'moto',
+          status: driver.status || 'available',
+          isAvailable: driver.isAvailable === true,
+          distanceKm: Math.round(distanceKm * 10) / 10 // Arrondi a 1 decimale
+        };
+        
+        if (driver.averageRating !== undefined) {
+          responseDriver.averageRating = driver.averageRating;
+        }
+        if (driver.ratingCount !== undefined) {
+          responseDriver.ratingCount = driver.ratingCount;
+        }
+
+        driversWithDistance.push(responseDriver);
+      }
+    }
+
+    driversWithDistance.sort((a, b) => a.distanceKm - b.distanceKm);
+
+    // 5. Maximum 3 rAcsultats (C7-C7 limitation)
+    const finalDrivers = driversWithDistance.slice(0, 3);
+
+    return res.status(200).json({ drivers: finalDrivers });
+
+  } catch (error) {
+    console.error('Error in /api/drivers/nearby:', error);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+// ============================================================
+// PHASE 2.2.1-B-C7-C7-H : POST /api/drivers/contact-request
+// Premier contact vers un livreur public sans exposer de PII.
+// ============================================================
+const driverContactRateLimits = new Map();
+
+app.post('/api/drivers/contact-request', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const sellerUid = decoded.uid;
+
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    // 1. Validation du payload (RESTRICTIF)
+    const { driverId, message } = req.body || {};
+    
+    if (!driverId || typeof driverId !== 'string' || driverId.trim() === '' || driverId.length > 128) {
+      return res.status(400).json({ error: 'INVALID_DRIVER_ID' });
+    }
+    if (driverId.includes('/') || driverId.includes('..')) {
+      return res.status(400).json({ error: 'INVALID_DRIVER_ID_FORMAT' });
+    }
+
+    if (!message || typeof message !== 'string' || message.trim() === '') {
+      return res.status(400).json({ error: 'INVALID_MESSAGE' });
+    }
+    
+    const cleanMessage = message.trim();
+    if (cleanMessage.length > 140) {
+      return res.status(400).json({ error: 'MESSAGE_TOO_LONG' });
+    }
+
+    // 2. Verification anti-spam (Vendeur : max 10/24h)
+    const now = Date.now();
+    let sellerRate = driverContactRateLimits.get(sellerUid) || { count: 0, resetTime: now + 24 * 60 * 60 * 1000 };
+    if (now > sellerRate.resetTime) {
+      sellerRate.count = 0;
+      sellerRate.resetTime = now + 24 * 60 * 60 * 1000;
+    }
+    if (sellerRate.count >= 10) {
+      return res.status(429).json({ error: 'SELLER_RATE_LIMIT_EXCEEDED' });
+    }
+
+    // 3. Verification de la disponibilite du livreur (driver_availability)
+    const availabilityRef = db.collection('driver_availability').doc(driverId);
+    const availabilitySnap = await availabilityRef.get();
+    
+    if (!availabilitySnap.exists) {
+      return res.status(404).json({ error: 'DRIVER_NOT_FOUND' });
+    }
+    
+    const availabilityData = availabilitySnap.data();
+    if (
+      availabilityData.userId !== driverId || 
+      availabilityData.isAvailable !== true || 
+      availabilityData.status !== 'active'
+    ) {
+      return res.status(403).json({ error: 'DRIVER_NOT_AVAILABLE' });
+    }
+
+    // 4. Verification de l'identite du vendeur et du telephone (stores)
+    const storesSnap = await db.collection('stores')
+      .where('ownerId', '==', sellerUid)
+      .limit(1)
+      .get();
+      
+    if (storesSnap.empty) {
+      return res.status(403).json({ error: 'SELLER_STORE_NOT_FOUND' });
+    }
+    
+    const storeDoc = storesSnap.docs[0];
+    const storeData = storeDoc.data();
+    const sellerPhone = storeData.phone;
+    const storeName = storeData.storeName || 'Vendeur W-Com';
+    
+    if (!sellerPhone || typeof sellerPhone !== 'string' || sellerPhone.trim() === '') {
+      return res.status(403).json({ error: 'SELLER_PHONE_MISSING' });
+    }
+
+    // 5. Verification de la relation et des cooldowns
+    const requestId = `${sellerUid}_${driverId}`;
+    const requestRef = db.collection('driver_contact_requests').doc(requestId);
+    const requestSnap = await requestRef.get();
+    
+    if (requestSnap.exists) {
+      const data = requestSnap.data();
+      const expiresAt = data.expiresAt ? data.expiresAt.toDate() : 0;
+      
+      if (data.status === 'pending' && expiresAt > new Date()) {
+        return res.status(409).json({ error: 'CONTACT_REQUEST_ALREADY_PENDING' });
+      }
+      
+      if (data.status === 'accepted') {
+        return res.status(409).json({ error: 'RELATION_ALREADY_EXISTS' });
+      }
+      
+      if (data.status === 'declined' && data.declinedAt) {
+        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        if (data.declinedAt.toDate() > thirtyDaysAgo) {
+          return res.status(429).json({ error: 'DECLINED_COOLDOWN_ACTIVE' });
+        }
+      }
+    }
+
+    // 6. Anti-spam Livreur (max 5 pending)
+    const pendingSnap = await db.collection('driver_contact_requests')
+      .where('driverId', '==', driverId)
+      .where('status', '==', 'pending')
+      .get();
+      
+    let activePendingCount = 0;
+    pendingSnap.forEach(doc => {
+      const data = doc.data();
+      if (data.expiresAt && data.expiresAt.toDate() > new Date()) {
+        activePendingCount++;
+      }
+    });
+    
+    if (activePendingCount >= 5) {
+      return res.status(429).json({ error: 'DRIVER_INBOX_FULL' });
+    }
+
+    // 7. Creation de la requete de contact Firestore
+    const expiresDate = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    
+    await requestRef.set({
+      sellerId: sellerUid,
+      storeId: storeDoc.id,
+      storeName: storeName,
+      driverId: driverId,
+      status: 'pending',
+      message: cleanMessage,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: admin.firestore.Timestamp.fromDate(expiresDate),
+      pushStatus: 'pending'
+    });
+
+    // Incrementer le rate limit vendeur car la requete Firestore est enregistree
+    sellerRate.count++;
+    driverContactRateLimits.set(sellerUid, sellerRate);
+
+    // 8. Envoi de la notification Push
+    const cleanPhone = sellerPhone.replace(/\D/g, '');
+    const whatsappUrl = `https://wa.me/${cleanPhone}`;
+    const pushPrefix = `Demande de ${storeName} : `;
+    
+    const payload = {
+      app_id: ONESIGNAL_APP_ID,
+      include_aliases: {
+        external_id: [driverId]
+      },
+      target_channel: "push",
+      headings: {
+        en: "Nouvelle demande de livraison",
+        fr: "Nouvelle demande de livraison"
+      },
+      contents: {
+        en: pushPrefix + cleanMessage,
+        fr: pushPrefix + cleanMessage
+      },
+      url: whatsappUrl
+    };
+
+    if (process.env.ONESIGNAL_REST_API_KEY) {
+      try {
+        const osResponse = await fetch('https://onesignal.com/api/v1/notifications', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            Authorization: `Basic ${process.env.ONESIGNAL_REST_API_KEY}`,
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (osResponse.ok) {
+          await requestRef.update({ pushStatus: 'sent' });
+        } else {
+          await requestRef.update({ pushStatus: 'failed' });
+          console.error('OneSignal failed for contact request', await osResponse.text());
+        }
+      } catch (e) {
+        await requestRef.update({ pushStatus: 'error' });
+        console.error('OneSignal network error for contact request', e.message);
+      }
+    } else {
+        await requestRef.update({ pushStatus: 'onesignal_not_configured' });
+    }
+
+    // Ne renvoie aucune donnee privee du livreur
+    return res.status(201).json({ success: true, status: 'pending' });
+
+  } catch (error) {
+    if (error.statusCode === 401) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    console.error('Error in /api/drivers/contact-request:', error);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+// ============================================================
+// PHASE 2.2.1-B-C7-C7-J : POST /api/drivers/traffic-alert
+// Broadcast d'alerte trafic aux livreurs publics proches (5km)
+// sans texte libre et sans controle OneSignal par le client.
+// ============================================================
+const trafficAlertRateLimits = new Map();
+const trafficAlertZoneCooldowns = []; // Simple in-memory zone cooldown array
+
+app.post('/api/drivers/traffic-alert', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const sellerUid = decoded.uid;
+
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    // 1. Validation GPS (seules donnees acceptees)
+    const { lat, lng } = req.body || {};
+    
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      return res.status(400).json({ error: 'INVALID_COORDINATES' });
+    }
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90) {
+      return res.status(400).json({ error: 'INVALID_LATITUDE' });
+    }
+    if (!Number.isFinite(lng) || lng < -180 || lng > 180) {
+      return res.status(400).json({ error: 'INVALID_LONGITUDE' });
+    }
+
+    // 2. Rate Limit Vendeur (1 alerte / 15 minutes)
+    const now = Date.now();
+    const rateData = trafficAlertRateLimits.get(sellerUid) || { resetTime: 0 };
+    if (now < rateData.resetTime) {
+      return res.status(429).json({ error: 'RATE_LIMIT_EXCEEDED' });
+    }
+    
+    // Cooldown Zone (optionnel, memoire uniquement, 10 min, rayon 2km par ex)
+    const recentZoneAlerts = trafficAlertZoneCooldowns.filter(a => now < a.expiresAt);
+    // Nettoyage en passant
+    trafficAlertZoneCooldowns.length = 0;
+    trafficAlertZoneCooldowns.push(...recentZoneAlerts);
+    
+    for (const alert of recentZoneAlerts) {
+      const dist = getDistanceMeters(lat, lng, alert.lat, alert.lng);
+      if (dist < 2000) { // 2km radius pour eviter les doublons
+        return res.status(429).json({ error: 'ZONE_COOLDOWN_ACTIVE' });
+      }
+    }
+
+    // 3. Source OpArationnelle: driver_availability
+    const availabilitySnap = await db.collection('driver_availability')
+      .where('isAvailable', '==', true)
+      .where('status', '==', 'active')
+      .get();
+
+    const operationalDrivers = [];
+    availabilitySnap.forEach(doc => {
+      // Exclure le vendeur lui-meme s'il est aussi livreur
+      if (doc.id !== sellerUid && doc.data().userId !== sellerUid) {
+        operationalDrivers.push(doc.id);
+      }
+    });
+
+    if (operationalDrivers.length === 0) {
+      // Marquer le rate limit meme si aucun livreur
+      trafficAlertRateLimits.set(sellerUid, { resetTime: now + 15 * 60 * 1000 });
+      return res.status(200).json({ success: true, count: 0 });
+    }
+
+    // 4. RAccupAcration GPS Prive (server-side ONLY) & Haversine
+    const nearbyDriverIds = [];
+    
+    for (let i = 0; i < operationalDrivers.length; i += 30) {
+      const chunk = operationalDrivers.slice(i, i + 30);
+      const gpsSnap = await db.collection('public_drivers')
+        .where('__name__', 'in', chunk)
+        .get();
+        
+      gpsSnap.forEach(doc => {
+        const data = doc.data();
+        if (
+          typeof data.lastLat === 'number' && typeof data.lastLng === 'number' &&
+          Number.isFinite(data.lastLat) && Number.isFinite(data.lastLng) &&
+          !(data.lastLat === 0 && data.lastLng === 0)
+        ) {
+          const distanceMeters = getDistanceMeters(lat, lng, data.lastLat, data.lastLng);
+          if (distanceMeters <= 5000) { // Rayon forcAc: 5km
+            nearbyDriverIds.push({ id: doc.id, distance: distanceMeters });
+          }
+        }
+      });
+    }
+
+    // Tri par distance et max 30
+    nearbyDriverIds.sort((a, b) => a.distance - b.distance);
+    const selectedDriverIds = nearbyDriverIds.slice(0, 30).map(d => d.id);
+
+    // Mettre a jour les rate limits (seulement si on envoie vraiment ou si on a essaye)
+    trafficAlertRateLimits.set(sellerUid, { resetTime: now + 15 * 60 * 1000 });
+    trafficAlertZoneCooldowns.push({ lat, lng, expiresAt: now + 10 * 60 * 1000 });
+
+    if (selectedDriverIds.length === 0) {
+      return res.status(200).json({ success: true, count: 0 });
+    }
+
+    // 5. Envoi Push OneSignal Server-Controlled
+    if (process.env.ONESIGNAL_REST_API_KEY && process.env.ONESIGNAL_APP_ID) {
+      const payload = {
+        app_id: process.env.ONESIGNAL_APP_ID,
+        include_aliases: {
+          external_id: selectedDriverIds
+        },
+        target_channel: "push",
+        headings: {
+          en: "Traffic Alert",
+          fr: "Alerte Trafic"
+        },
+        contents: {
+          en: "A traffic alert has been reported near your location.",
+          fr: "Une alerte trafic a A(c)tA(c) signalA(c)e A  proximitA(c) de votre position."
+        }
+      };
+
+      try {
+        await fetch('https://onesignal.com/api/v1/notifications', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            Authorization: `Basic ${process.env.ONESIGNAL_REST_API_KEY}`,
+          },
+          body: JSON.stringify(payload),
+        });
+        // Ignore response errors for broadcast, don't expose them
+      } catch (e) {
+        console.error('OneSignal network error for traffic alert', e.message);
+      }
+    }
+
+    return res.status(200).json({ success: true });
+
+  } catch (error) {
+    if (error.statusCode === 401) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    console.error('Error in /api/drivers/traffic-alert:', error);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+// ============================================================
+// PHASE 2.2.1-B-C7-C7-M : POST /api/drivers/rate
+// ============================================================
+app.post('/api/drivers/rate', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const buyerUid = decoded.uid;
+
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const { orderId, driverId, rating, comment = '' } = req.body || {};
+
+    if (!orderId || typeof orderId !== 'string') {
+      return res.status(400).json({ error: 'INVALID_ORDER_ID' });
+    }
+    if (!driverId || typeof driverId !== 'string') {
+      return res.status(400).json({ error: 'INVALID_DRIVER_ID' });
+    }
+    if (typeof rating !== 'number' || rating < 1 || rating > 5 || !Number.isInteger(rating)) {
+      return res.status(400).json({ error: 'INVALID_RATING' });
+    }
+    
+    // Authorization & Idempotency in a Transaction
+    await db.runTransaction(async (txn) => {
+      // 1. Verifier l'idempotence (rating deja effectue pour cette commande ?)
+      const ratingRef = db.collection('driver_ratings').doc(orderId);
+      const existingRating = await txn.get(ratingRef);
+      if (existingRating.exists) {
+        throw new Error('ALREADY_RATED'); // Sera catche et retournera 409
+      }
+
+      // 2. Verifier l'autorisation via la commande
+      const orderRef = db.collection('orders').doc(orderId);
+      const orderSnap = await txn.get(orderRef);
+      if (!orderSnap.exists) {
+        throw new Error('ORDER_NOT_FOUND');
+      }
+      
+      const order = orderSnap.data();
+      if (order.buyerId !== buyerUid) {
+        throw new Error('UNAUTHORIZED_BUYER');
+      }
+      if (order.status !== 'delivered') {
+        throw new Error('ORDER_NOT_DELIVERED');
+      }
+      
+      // Resolution du driverId reel (comme dans _resolvePublicDriverId de Flutter)
+      const assignedDriverId = order.assignedDriverId;
+      if (!assignedDriverId) {
+        throw new Error('NO_DRIVER_ASSIGNED');
+      }
+      
+      let resolvedDriverId = null;
+      const publicDocSnap = await txn.get(db.collection('public_drivers').doc(assignedDriverId));
+      if (publicDocSnap.exists) {
+        resolvedDriverId = assignedDriverId;
+      } else {
+        const fleetDocSnap = await txn.get(db.collection('delivery_drivers').doc(assignedDriverId));
+        if (fleetDocSnap.exists) {
+          const linkedUserId = fleetDocSnap.data().userId;
+          if (linkedUserId && typeof linkedUserId === 'string' && linkedUserId.trim() !== '') {
+            resolvedDriverId = linkedUserId;
+          }
+        }
+      }
+      
+      if (!resolvedDriverId) {
+        throw new Error('DRIVER_NOT_RATABLE');
+      }
+      
+      if (resolvedDriverId !== driverId) {
+        // Le client essaie de noter un autre livreur que celui reellement assigne
+        throw new Error('DRIVER_MISMATCH');
+      }
+      
+      // 3. Lire le profil et calculer la moyenne
+      const driverRef = db.collection('public_drivers').doc(resolvedDriverId);
+      const driverSnap = await txn.get(driverRef);
+      if (!driverSnap.exists) {
+        throw new Error('DRIVER_NOT_FOUND');
+      }
+      
+      const driverData = driverSnap.data();
+      const oldAvg = typeof driverData.averageRating === 'number' ? driverData.averageRating : 0.0;
+      const oldCount = typeof driverData.ratingCount === 'number' ? driverData.ratingCount : 0;
+      
+      const newCount = oldCount + 1;
+      const newAvgRaw = oldCount === 0 ? rating : ((oldAvg * oldCount) + rating) / newCount;
+      const newAvg = Number(newAvgRaw.toFixed(2));
+      
+      // 4. Ecriture (Rating, Public Profile, Availability)
+      txn.set(ratingRef, {
+        orderId: orderId,
+        driverId: resolvedDriverId,
+        buyerId: buyerUid,
+        buyerName: decoded.name || decoded.email || 'Client',
+        rating: rating,
+        comment: typeof comment === 'string' ? comment.trim() : '',
+        timestamp: require('firebase-admin').firestore.FieldValue.serverTimestamp(),
+      });
+      
+      txn.update(driverRef, {
+        averageRating: newAvg,
+        ratingCount: newCount,
+      });
+      
+      const availabilityRef = db.collection('driver_availability').doc(resolvedDriverId);
+      txn.set(availabilityRef, {
+        userId: resolvedDriverId,
+        name: driverData.name || '',
+        vehicleType: driverData.vehicleType || driverData.vehicle || '',
+        status: driverData.status || 'active',
+        isAvailable: driverData.isAvailable || false,
+        averageRating: newAvg,
+        ratingCount: newCount,
+      }, { merge: true });
+    });
+
+    return res.status(200).json({ success: true });
+
+  } catch (error) {
+    if (error.statusCode === 401) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    if (error.message === 'ALREADY_RATED') {
+      return res.status(409).json({ error: 'ALREADY_RATED' });
+    }
+    if (error.message === 'UNAUTHORIZED_BUYER' || error.message === 'DRIVER_MISMATCH') {
+      return res.status(403).json({ error: error.message });
+    }
+    if (error.message === 'ORDER_NOT_FOUND' || error.message === 'DRIVER_NOT_FOUND' || error.message === 'DRIVER_NOT_RATABLE') {
+      return res.status(404).json({ error: error.message });
+    }
+    if (error.message === 'ORDER_NOT_DELIVERED' || error.message === 'NO_DRIVER_ASSIGNED') {
+      return res.status(400).json({ error: error.message });
+    }
+    
+    console.error('Error in /api/drivers/rate:', error);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.post('/api/risk/alert', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
+
+    // Rate Limiting : 1 requete / 60s / UID (protection anti-spam niveau 1 en memoire)
+    const now = Date.now();
+    const rateData = riskAlertRateLimits.get(uid) || { count: 0, resetTime: now + 60000 };
+    if (now > rateData.resetTime) {
+      rateData.count = 0;
+      rateData.resetTime = now + 60000;
+    }
+    rateData.count++;
+    riskAlertRateLimits.set(uid, rateData);
+    if (rateData.count > 1) {
+      return res.status(429).json({ error: 'rate_limit_exceeded' });
+    }
+
+    // Validation du payload
+    const { lat, lng, description } = req.body || {};
+    
+    if (typeof lat !== 'number' || !Number.isFinite(lat) || lat < -90 || lat > 90) {
+      return res.status(400).json({ error: 'invalid_lat' });
+    }
+    if (typeof lng !== 'number' || !Number.isFinite(lng) || lng < -180 || lng > 180) {
+      return res.status(400).json({ error: 'invalid_lng' });
+    }
+    
+    if (typeof description !== 'string') {
+      return res.status(400).json({ error: 'invalid_description' });
+    }
+    const trimmedDesc = description.trim();
+    if (trimmedDesc.length === 0 || trimmedDesc.length > 500) {
+      return res.status(400).json({ error: 'invalid_description' });
+    }
+
+    if (!db) {
+      return res.status(500).json({ error: 'database_not_initialized' });
+    }
+
+    // Lecture Firestore (Admin SDK)
+    const driversSnap = await db.collection('public_drivers')
+      .where('isAvailable', '==', true)
+      .where('status', '==', 'active')
+      .get();
+
+    const nearbyDriverIds = [];
+    driversSnap.forEach((doc) => {
+      // Ignorer l'emetteur s'il est lui-meme driver
+      if (doc.id === uid) return;
+
+      const data = doc.data();
+      const driverLat = data.lastLat;
+      const driverLng = data.lastLng;
+
+      if (typeof driverLat !== 'number' || typeof driverLng !== 'number') return;
+      if (driverLat === 0 && driverLng === 0) return; // Fallback invalide courant
+
+      const distance = getDistanceMeters(lat, lng, driverLat, driverLng);
+      if (distance <= 5000) { // Rayon 5000m fixe
+        nearbyDriverIds.push(doc.id);
+      }
+    });
+
+    if (nearbyDriverIds.length === 0) {
+      return res.status(200).json({ success: true });
+    }
+
+    // Appel OneSignal
+    const restApiKey = process.env.ONESIGNAL_REST_API_KEY;
+    if (!restApiKey) {
+      return res.status(502).json({ error: 'onesignal_not_configured' });
+    }
+
+    const shortDescription = trimmedDesc.length > 100 
+      ? trimmedDesc.substring(0, 100) + '...' 
+      : trimmedDesc;
+
+    const payload = {
+      app_id: ONESIGNAL_APP_ID,
+      target_channel: 'push',
+      include_aliases: { external_id: nearbyDriverIds },
+      headings: { en: 'Zone à risque signalée', fr: 'Zone à risque signalée' },
+      contents: { en: shortDescription, fr: shortDescription },
+      data: { type: 'risk_zone_alert', lat, lng }
+    };
+
+    const oneSignalResponse = await fetch('https://onesignal.com/api/v1/notifications', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Authorization': `Basic ${restApiKey}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!oneSignalResponse.ok) {
+      console.error(`[RiskZone] OneSignal push failed for ${uid}. Status: ${oneSignalResponse.status}`);
+      return res.status(502).json({ error: 'push_delivery_failed' });
+    }
+
+    return res.status(200).json({ success: true });
+
+  } catch (err) {
+    console.error(`[RiskZone] Error processing alert:`, err.message);
+    if (err.statusCode === 401) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
 app.post('/notifications/push', async (req, res) => {
   try {
     await requireAuth(req);
@@ -2221,7 +3086,7 @@ app.post('/notifications/push', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('W‑Com Genius Pay backend is running');
+  res.send('Wâ€‘Com Genius Pay backend is running');
 });
 
 // ---------------------------
@@ -2306,7 +3171,7 @@ async function reconcileBusinessHours() {
       }
     }
   } catch (e) {
-    console.error('❌ reconcileBusinessHours:', e.message);
+    console.error('âŒ reconcileBusinessHours:', e.message);
   }
 }
 
@@ -2327,11 +3192,11 @@ async function reconcileSubscriptionExpiry() {
       const expired = !subscriptionDate || subscriptionDate.toDate() < now;
       if (expired) {
         await storeDoc.ref.update({ isActive: false });
-        console.log(`ℹ️ Boutique ${storeDoc.id} désactivée (abonnement expiré)`);
+        console.log(`â„¹ï¸ Boutique ${storeDoc.id} dÃ©sactivÃ©e (abonnement expirÃ©)`);
       }
     }
   } catch (e) {
-    console.error('❌ reconcileSubscriptionExpiry:', e.message);
+    console.error('âŒ reconcileSubscriptionExpiry:', e.message);
   }
 }
 
@@ -2385,8 +3250,8 @@ async function reconcileSubscriptionReminders() {
         Math.ceil((expiryMs - now.getTime()) / (24 * 60 * 60 * 1000))
       );
       const planName = data.currentPlan || 'votre forfait';
-      const title = '⏳ Votre abonnement expire bientôt';
-      const message = `Il vous reste ${daysRemaining} jour${daysRemaining > 1 ? 's' : ''} avant la fin de votre abonnement ${planName}. Renouvelez dès maintenant pour ne pas perdre l'accès à votre boutique.`;
+      const title = 'â³ Votre abonnement expire bientÃ´t';
+      const message = `Il vous reste ${daysRemaining} jour${daysRemaining > 1 ? 's' : ''} avant la fin de votre abonnement ${planName}. Renouvelez dÃ¨s maintenant pour ne pas perdre l'accÃ¨s Ã  votre boutique.`;
 
       await db.collection('notifications').add({
         receiverId: userDoc.id,
@@ -2409,10 +3274,10 @@ async function reconcileSubscriptionReminders() {
       });
 
       await userDoc.ref.update({ subscriptionReminderForExpiryMs: expiryMs });
-      console.log(`🔔 Rappel abonnement envoyé à ${userDoc.id} (${daysRemaining}j restants)`);
+      console.log(`ðŸ”” Rappel abonnement envoyÃ© Ã  ${userDoc.id} (${daysRemaining}j restants)`);
     }
   } catch (e) {
-    console.error('❌ reconcileSubscriptionReminders:', e.message);
+    console.error('âŒ reconcileSubscriptionReminders:', e.message);
   }
 }
 
@@ -2492,7 +3357,7 @@ app.post('/api/cloudinary/sign-upload', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log(`ðŸš€ Server listening on port ${PORT}`);
 });
 
 

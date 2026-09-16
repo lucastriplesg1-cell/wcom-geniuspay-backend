@@ -424,42 +424,123 @@ async function handleDriverSubscriptionWebhook(status, metadata) {
   console.log(`âœ… Abonnement livreur confirmÃ© pour ${userId}, expire le ${expiryDate.toISOString()}`);
 }
 
+function isValidOrder(order) {
+  const status = order.status;
+  const paymentStatus = order.paymentStatus;
+  
+  if (status === 'cancelled' || status === 'awaiting_payment') {
+    return false;
+  }
+  if (paymentStatus === 'checkout_failed') {
+    return false;
+  }
+  return true;
+}
+
 async function handleOrderWebhook(status, metadata) {
   const { orderId, buyerId, sellerId } = metadata;
   if (!orderId) {
-    console.error('âŒ Webhook commande sans orderId dans metadata');
+    console.error('❌ Webhook commande sans orderId dans metadata');
     return;
   }
 
   const orderRef = db.collection('orders').doc(orderId);
-  const orderSnap = await orderRef.get();
-  if (!orderSnap.exists) {
-    console.error(`âŒ Webhook commande introuvable: ${orderId}`);
+  let sideEffects = null;
+
+  try {
+    await db.runTransaction(async (transaction) => {
+      const orderSnap = await transaction.get(orderRef);
+      if (!orderSnap.exists) {
+        throw new Error('ORDER_NOT_FOUND');
+      }
+      const orderData = orderSnap.data();
+
+      let newOrderData = null;
+      if (status === 'completed') {
+        newOrderData = {
+          paymentStatus: 'completed',
+          status: 'pending',
+        };
+      } else if (['failed', 'cancelled', 'expired'].includes(status)) {
+        newOrderData = {
+          paymentStatus: 'checkout_failed',
+          status: 'cancelled',
+        };
+      } else {
+        sideEffects = { type: 'intermediate' };
+        return;
+      }
+
+      const wasValid = isValidOrder(orderData);
+      const willBeValid = isValidOrder({ ...orderData, ...newOrderData });
+      const delta = (willBeValid ? 1 : 0) - (wasValid ? 1 : 0);
+
+      let chatRef = null;
+      let newValidOrdersCount = null;
+
+      if (delta !== 0) {
+        const sellerIdForChat = orderData.sellerId || sellerId;
+        const buyerIdForChat = orderData.buyerId || buyerId;
+
+        if (sellerIdForChat && buyerIdForChat) {
+          const chatSnap = await transaction.get(
+            db.collection('chats')
+              .where('sellerId', '==', sellerIdForChat)
+              .where('buyerId', '==', buyerIdForChat)
+              .limit(2)
+          );
+
+          if (chatSnap.size > 1) {
+            console.error(`ABORTED_DUPLICATE_CHAT_RELATION for order ${orderId} (seller: ${sellerIdForChat}, buyer: ${buyerIdForChat}) - found ${chatSnap.size} chats`);
+            throw new Error('ABORTED_DUPLICATE_CHAT_RELATION');
+          }
+
+          if (chatSnap.size === 1) {
+            const chatDoc = chatSnap.docs[0];
+            const currentCount = chatDoc.data().validOrdersCount;
+            if (currentCount !== undefined && typeof currentCount !== 'number') {
+               throw new Error('INVALID_COUNTER_TYPE');
+            }
+            const baseCount = typeof currentCount === 'number' ? currentCount : 0;
+            newValidOrdersCount = baseCount + delta;
+            if (newValidOrdersCount < 0) {
+              throw new Error('NEGATIVE_COUNTER');
+            }
+            chatRef = chatDoc.ref;
+          }
+        }
+      }
+
+      const orderUpdatePayload = {
+        ...newOrderData,
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      
+      transaction.update(orderRef, orderUpdatePayload);
+      if (chatRef && newValidOrdersCount !== null) {
+        transaction.update(chatRef, { validOrdersCount: newValidOrdersCount });
+      }
+
+      if (status === 'completed') {
+         sideEffects = { type: 'completed', orderData };
+      } else {
+         sideEffects = { type: 'failed' };
+      }
+    });
+  } catch (err) {
+    if (err.message === 'ORDER_NOT_FOUND') {
+      console.error(`❌ Webhook commande introuvable: ${orderId}`);
+    } else {
+      console.error(`❌ Webhook commande erreur transaction: ${err.message}`);
+    }
     return;
   }
-  const orderData = orderSnap.data();
 
-  if (status === 'completed') {
-    // BUG (signale par l'utilisateur 2026-09-05, corrige) : seul paymentStatus
-    // passait a 'completed' ici -- orders.status restait bloque sur
-    // 'awaiting_payment' (sa valeur de creation) jusqu'a ce que le vendeur
-    // clique manuellement "Expedier" ou que le PIN de livraison soit valide.
-    // Une commande reellement payee s'affichait donc indefiniment comme "en
-    // attente de paiement" cote vendeur. 'pending' est le statut suivant
-    // attendu par le client (orders_screen.dart::_statusLabel).
-    await orderRef.update({
-      paymentStatus: 'completed',
-      status: 'pending',
-      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    // Notifier le vendeur et vider le panier de l'acheteur -- dÃ©placÃ© ici
-    // depuis le client (checkout_screen.dart), qui ne pouvait pas savoir si
-    // le paiement avait rÃ©ellement abouti aprÃ¨s avoir simplement ouvert la
-    // page de paiement Genius Pay.
+  if (sideEffects?.type === 'completed') {
+    const orderData = sideEffects.orderData;
     if (sellerId) {
       const title = 'Nouvelle commande';
-      const message = `${orderData.buyerName || 'Un client'} a passÃ© une commande de ${orderData.totalAmount} CFA`;
+      const message = `${orderData.buyerName || 'Un client'} a passé une commande de ${orderData.totalAmount} CFA`;
       await db.collection('notifications').add({
         receiverId: sellerId,
         type: 'order',
@@ -468,34 +549,30 @@ async function handleOrderWebhook(status, metadata) {
         message,
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         data: { orderId },
-      });
-      await notifySellerPush(sellerId, title, message, { amount: orderData.totalAmount });
+      }).catch(e => console.error(e));
+      await notifySellerPush(sellerId, title, message, { amount: orderData.totalAmount }).catch(e => console.error(e));
     }
 
     if (buyerId) {
-      const cartSnap = await db.collection('cart').where('buyerId', '==', buyerId).get();
-      if (!cartSnap.empty) {
-        const batch = db.batch();
-        cartSnap.docs.forEach((doc) => batch.delete(doc.ref));
-        await batch.commit();
+      try {
+        const cartSnap = await db.collection('cart').where('buyerId', '==', buyerId).get();
+        if (!cartSnap.empty) {
+          const batch = db.batch();
+          cartSnap.docs.forEach((doc) => batch.delete(doc.ref));
+          await batch.commit();
+        }
+      } catch(e) {
+        console.error(e);
       }
     }
 
-    console.log(`âœ… Commande ${orderId} confirmÃ©e payÃ©e`);
-  } else if (['failed', 'cancelled', 'expired'].includes(status)) {
-    // Le panier N'EST PAS vidÃ© : le client garde ses articles et peut
-    // rÃ©essayer le paiement.
-    await orderRef.update({
-      paymentStatus: 'checkout_failed',
-      status: 'cancelled',
-      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    console.log(`â„¹ï¸ Commande ${orderId} : paiement ${status}, panier conservÃ© pour rÃ©essai`);
-  } else {
-    console.log(`â„¹ï¸ Commande ${orderId} : statut intermÃ©diaire ${status}`);
+    console.log(`✅ Commande ${orderId} confirmée payée`);
+  } else if (sideEffects?.type === 'failed') {
+    console.log(`ℹ️ Commande ${orderId} : paiement ${status}, panier conservé pour réessai`);
+  } else if (sideEffects?.type === 'intermediate') {
+    console.log(`ℹ️ Commande ${orderId} : statut intermédiaire ${status}`);
   }
 }
-
 // Confirme le paiement d'une campagne marketing (create_campaign_screen.dart)
 // et, pour les campagnes "In-App", pose la mise en avant sur les produits de
 // la boutique -- cote serveur uniquement (Admin SDK, contourne les regles
@@ -3363,3 +3440,133 @@ app.listen(PORT, () => {
 
 
 
+
+
+// ==========================================
+// Phase 2.2.2-C2-C: Order Status Endpoint
+// ==========================================
+app.patch('/api/orders/:orderId/status', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    const uid = decoded.uid;
+    const { orderId } = req.params;
+    
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const { status } = req.body;
+    // Strict status validation
+    if (!['shipped', 'delivered', 'cancelled'].includes(status)) {
+      return res.status(400).json({ error: 'invalid status' });
+    }
+
+    const orderRef = db.collection('orders').doc(orderId);
+    let result = null;
+
+    await db.runTransaction(async (t) => {
+      const orderSnap = await t.get(orderRef);
+      if (!orderSnap.exists) {
+        throw new Error('ORDER_NOT_FOUND');
+      }
+      
+      const orderData = orderSnap.data();
+      
+      // Authorization: Seller only based on current Flutter app architecture
+      if (orderData.sellerId !== uid) {
+        throw new Error('UNAUTHORIZED');
+      }
+
+      // Idempotency: Ignore if status is already requested status
+      if (orderData.status === status) {
+        result = { status: 'already_applied' };
+        return;
+      }
+
+      // Transition limits: Prevent illogical transitions
+      if (orderData.status === 'cancelled') {
+        throw new Error('TRANSITION_DENIED_FROM_CANCELLED'); 
+      }
+      if (orderData.status === 'delivered' && status === 'shipped') {
+        throw new Error('TRANSITION_DENIED_REVERSE_LOGISTICS');
+      }
+
+      const wasValid = isValidOrder(orderData);
+      const willBeValid = isValidOrder({ ...orderData, status });
+      const delta = (willBeValid ? 1 : 0) - (wasValid ? 1 : 0);
+
+      let chatRef = null;
+      let newValidOrdersCount = null;
+
+      if (delta !== 0) {
+        const chatSnap = await t.get(
+          db.collection('chats')
+            .where('sellerId', '==', orderData.sellerId)
+            .where('buyerId', '==', orderData.buyerId)
+            .limit(2)
+        );
+
+        if (chatSnap.size > 1) {
+          console.error(`ABORTED_DUPLICATE_CHAT_RELATION for order ${orderId} (seller: ${orderData.sellerId}, buyer: ${orderData.buyerId}) - found ${chatSnap.size} chats`);
+          throw new Error('ABORTED_DUPLICATE_CHAT_RELATION');
+        }
+
+        if (chatSnap.size === 1) {
+          const chatDoc = chatSnap.docs[0];
+          const currentCount = chatDoc.data().validOrdersCount;
+          if (currentCount !== undefined && typeof currentCount !== 'number') {
+            throw new Error('INVALID_COUNTER_TYPE');
+          }
+          const baseCount = typeof currentCount === 'number' ? currentCount : 0;
+          newValidOrdersCount = baseCount + delta;
+          if (newValidOrdersCount < 0) {
+            throw new Error('NEGATIVE_COUNTER');
+          }
+          chatRef = chatDoc.ref;
+        }
+      }
+
+      // statusHistory entry (without label so Flutter falls back to localized strings)
+      const historyEntry = {
+        status: status,
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
+      };
+
+      const orderUpdate = {
+        status: status,
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        statusHistory: admin.firestore.FieldValue.arrayUnion(historyEntry)
+      };
+
+      t.update(orderRef, orderUpdate);
+      if (chatRef && newValidOrdersCount !== null) {
+        t.update(chatRef, { validOrdersCount: newValidOrdersCount });
+      }
+
+      result = { status: 'success' };
+    });
+
+    if (result && result.status === 'already_applied') {
+      return res.status(200).json({ status: 'already_applied' });
+    }
+    return res.status(200).json({ status: 'success' });
+
+  } catch (err) {
+    if (err.message === 'ORDER_NOT_FOUND') {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (err.message === 'UNAUTHORIZED') {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    if (err.message.startsWith('TRANSITION_DENIED')) {
+      return res.status(409).json({ error: 'Invalid state transition' });
+    }
+    if (err.message === 'ABORTED_DUPLICATE_CHAT_RELATION' || 
+        err.message === 'INVALID_COUNTER_TYPE' || 
+        err.message === 'NEGATIVE_COUNTER') {
+      return res.status(422).json({ error: 'Data consistency conflict' }); // 422 as requested if exists, or 409
+    }
+    
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    console.error('PATCH /api/orders/:orderId/status error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});

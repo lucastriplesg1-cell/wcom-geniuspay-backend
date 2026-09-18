@@ -302,6 +302,8 @@ app.post('/webhook/genius-pay', async (req, res) => {
       await handleOrderWebhook(status, metadata);
     } else if (metadata.paymentKind === 'campaign') {
       await handleCampaignWebhook(status, metadata);
+    } else if (metadata.paymentKind === 'service_order') {
+      await handleServiceOrderWebhook(status, metadata);
     } else {
       console.warn('âš ï¸ Webhook Genius Pay avec metadata.paymentKind inconnu:', metadata);
     }
@@ -674,6 +676,40 @@ async function handleCampaignWebhook(status, metadata) {
   }
 }
 
+async function handleServiceOrderWebhook(status, metadata) {
+  const { workspaceId, serviceOrderId } = metadata;
+  if (!workspaceId || !serviceOrderId) {
+    console.error('❌ Webhook service_order sans workspaceId ou serviceOrderId');
+    return;
+  }
+
+  const orderRef = db
+    .collection('workspaces')
+    .doc(workspaceId)
+    .collection('service_orders')
+    .doc(serviceOrderId);
+
+  const orderSnap = await orderRef.get();
+  if (!orderSnap.exists) {
+    console.error(`❌ Service order introuvable: ${workspaceId}/${serviceOrderId}`);
+    return;
+  }
+
+  if (status === 'completed') {
+    await orderRef.update({
+      paymentStatus: 'paid',
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`✅ Service order ${serviceOrderId} confirmé payé`);
+  } else if (['failed', 'cancelled', 'expired'].includes(status)) {
+    await orderRef.update({
+      paymentStatus: 'failed',
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`ℹ️ Service order ${serviceOrderId} : paiement ${status}`);
+  }
+}
+
 // ---------------------------
 // Verifie le token Firebase envoye par le client (header Authorization:
 // Bearer <idToken>). Renvoie le uid decode, ou lance si absent/invalide.
@@ -744,6 +780,12 @@ app.post('/transaction/confirm/:reference', async (req, res) => {
       }
       if (!db) return res.status(503).json({ error: 'firestore not configured' });
       await handleCampaignWebhook(status, metadata);
+    } else if (metadata.paymentKind === 'service_order') {
+      if (metadata.clientId && metadata.clientId !== decoded.uid) {
+        return res.status(403).json({ error: 'not your payment' });
+      }
+      if (!db) return res.status(503).json({ error: 'firestore not configured' });
+      await handleServiceOrderWebhook(status, metadata);
     } else {
       return res.status(400).json({ error: 'unknown paymentKind in metadata' });
     }

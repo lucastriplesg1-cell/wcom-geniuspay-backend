@@ -1178,6 +1178,147 @@ app.post('/escrow/release', async (req, res) => {
 });
 
 // ---------------------------
+// Demande de remboursement -- seul le vendeur de la commande (ou un admin)
+// peut la declencher (orders_screen.dart, bouton "Annuler"). Avant cet
+// endpoint, l'app appelait une Cloud Function jamais deployee
+// (us-central1-w-com-view.cloudfunctions.net/requestRefund, le projet
+// Firebase n'etant pas sur le plan Blaze) : la demande de remboursement
+// echouait silencieusement en production (audit du 2026-09-25).
+//
+// Modele calque sur /withdrawal/request : ce backend n'appelle jamais
+// Genius Pay pour renvoyer de l'argent (seules la creation et la
+// verification de paiement sont integrees), donc pas de reversement
+// automatique ici -- on enregistre la demande et, quand l'argent est
+// encore compte dans le solde du vendeur (computeAvailableBalance),
+// on exclut la commande de ce calcul en la marquant 'refunded'. Le
+// virement reel au client reste, comme les retraits vendeur, un
+// traitement manuel.
+// ---------------------------
+app.post('/refund/request', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const { order_id: orderId, operation_id: operationId } = req.body || {};
+    if (!orderId) {
+      return res.status(400).json({ error: 'order_id required' });
+    }
+    const uid = decoded.uid;
+
+    const orderRef = db.collection('orders').doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      return res.status(404).json({ error: 'order not found' });
+    }
+    const order = orderSnap.data();
+
+    // Autorisation : le vendeur de CETTE commande (seul appelant reel,
+    // orders_screen.dart) ou un admin -- sans ce controle, n'importe quel
+    // utilisateur authentifie connaissant un order_id pouvait forcer le
+    // remboursement d'une commande qui n'est pas la sienne.
+    let isAuthorized = order.sellerId === uid;
+    if (!isAuthorized) {
+      const adminSnap = await db.collection('admins').doc(uid).get();
+      isAuthorized = adminSnap.exists;
+    }
+    if (!isAuthorized) {
+      return res.status(403).json({ error: 'not authorized for this order' });
+    }
+
+    // Idempotence : un seul remboursement par commande (ID deterministe).
+    const refundRef = db.collection('refunds').doc(orderId);
+    const existingRefund = await refundRef.get();
+    if (existingRefund.exists) {
+      const existing = existingRefund.data();
+      return res.json({
+        success: true,
+        refundId: refundRef.id,
+        status: existing.status,
+        alreadyProcessed: true,
+      });
+    }
+
+    const escrowId = order.escrowId;
+    if (!escrowId) {
+      return res.status(409).json({ error: 'order has no linked escrow' });
+    }
+    const escrowRef = db.collection('escrow').doc(escrowId);
+    const escrowSnap = await escrowRef.get();
+    if (!escrowSnap.exists) {
+      return res.status(404).json({ error: 'escrow not found' });
+    }
+    const escrow = escrowSnap.data();
+
+    if (escrow.status === 'refunded' || escrow.status === 'refunding') {
+      return res.status(409).json({ error: 'refund already in progress or completed' });
+    }
+    if (escrow.status !== 'in_escrow' && escrow.status !== 'released') {
+      return res.status(409).json({ error: `cannot refund escrow in status: ${escrow.status}` });
+    }
+
+    const isPostRelease = escrow.status === 'released';
+    const refundAmount = Number(escrow.totalAmount ?? order.totalAmount ?? 0);
+    const sellerDebitAmount = Number(escrow.sellerAmount ?? 0);
+
+    let refundStatus;
+    // Avant liberation, l'argent n'a jamais rejoint le solde du vendeur --
+    // rien a en exclure.
+    let excludeFromBalance = !isPostRelease;
+
+    if (isPostRelease) {
+      // Post-liberation, cette commande compte deja dans
+      // computeAvailableBalance (order.status === 'delivered'). On ne l'en
+      // exclut (order.status = 'refunded') que si l'argent y est encore --
+      // sinon le vendeur l'a deja retire, et la reprise doit se faire
+      // manuellement (meme logique prudente que le solde insuffisant sur
+      // /withdrawal/request).
+      const availableBalance = await computeAvailableBalance(order.sellerId);
+      if (availableBalance >= sellerDebitAmount) {
+        refundStatus = 'pending';
+        excludeFromBalance = true;
+      } else {
+        refundStatus = 'refund_pending_funds';
+      }
+    } else {
+      refundStatus = 'pending';
+    }
+
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    await refundRef.set({
+      orderId,
+      escrowId,
+      buyerId: order.buyerId || null,
+      sellerId: order.sellerId || null,
+      refundAmount,
+      sellerDebitAmount,
+      status: refundStatus,
+      isPostRelease,
+      operationId: operationId || null,
+      requestedBy: uid,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const orderUpdate = { refundStatus, lastUpdated: now };
+    if (excludeFromBalance) {
+      orderUpdate.status = 'refunded';
+    }
+    await orderRef.update(orderUpdate);
+
+    await escrowRef.update({
+      status: refundStatus === 'pending' ? 'refunding' : escrow.status,
+      lastUpdated: now,
+    });
+
+    res.json({ success: true, refundId: refundRef.id, status: refundStatus });
+  } catch (e) {
+    console.error('Refund request error:', e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+// ---------------------------
 // Octroi gratuit en mode test -- PAYMENTS_DISABLED est ici une variable
 // d'environnement DU SERVEUR (Render), pas du client : contrairement au flag
 // cote app (lib/services/payment_config.dart, extrait facilement d'un APK),

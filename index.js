@@ -108,6 +108,116 @@ try {
 }
 
 // ---------------------------
+// Brevo -- double canal (push + email) pour /notifications/push.
+// BREVO_API_KEY / BREVO_SENDER_EMAIL / BREVO_SENDER_NAME sont a definir sur
+// Render, jamais dans le code (meme logique que ONESIGNAL_REST_API_KEY).
+// Best-effort : une erreur Brevo est loguee mais ne fait jamais echouer la
+// reponse du endpoint (le push OneSignal reste la source de verite).
+// ---------------------------
+function buildBrandedEmailHtml({ title, body }) {
+  const safeTitle = String(title || '').replace(/</g, '&lt;');
+  const safeBody = String(body || '')
+    .replace(/</g, '&lt;')
+    .replace(/\n/g, '<br>');
+  return `<!DOCTYPE html>
+<html>
+  <body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,Helvetica,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;overflow:hidden;">
+            <tr>
+              <td style="background:#009639;padding:20px 24px;">
+                <span style="color:#ffffff;font-size:20px;font-weight:bold;letter-spacing:0.5px;">W-COM</span>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:28px 24px;">
+                <h1 style="margin:0 0 12px;font-size:18px;color:#111111;">${safeTitle}</h1>
+                <p style="margin:0;font-size:15px;line-height:1.5;color:#333333;">${safeBody}</p>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:16px 24px;background:#fafafa;">
+                <p style="margin:0;font-size:12px;color:#999999;">
+                  Vous recevez cet email car vous avez une notification associee a votre compte W-COM.
+                </p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+}
+
+async function sendBrevoEmail({ to, toName, subject, title, body }) {
+  if (!process.env.BREVO_API_KEY || !process.env.BREVO_SENDER_EMAIL) return;
+  if (!to) return;
+  try {
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'api-key': process.env.BREVO_API_KEY,
+      },
+      body: JSON.stringify({
+        sender: {
+          email: process.env.BREVO_SENDER_EMAIL,
+          name: process.env.BREVO_SENDER_NAME || 'W-COM',
+        },
+        to: [{ email: to, name: toName || undefined }],
+        subject: subject || title || 'Notification W-COM',
+        htmlContent: buildBrandedEmailHtml({ title, body }),
+      }),
+    });
+    if (!response.ok) {
+      console.error('Brevo email failed:', response.status, await response.text());
+    }
+  } catch (e) {
+    console.error('Brevo email network error:', e.message);
+  }
+}
+
+// Resout les destinataires email d'un payload OneSignal : uniquement les
+// envois cibles (include_aliases.external_id / include_external_user_ids),
+// jamais les diffusions par segment (included_segments) -- un segment n'a
+// pas de liste d'emails individuelle a cette echelle, et melanger campagne
+// marketing et email transactionnel ici serait dangereux.
+async function sendEmailsForPushPayload(payload) {
+  if (!db || !process.env.BREVO_API_KEY) return;
+
+  const ids = new Set([
+    ...(payload.include_aliases?.external_id || []),
+    ...(payload.include_external_user_ids || []),
+  ]);
+  if (ids.size === 0) return;
+
+  const title = payload.headings?.fr || payload.headings?.en || '';
+  const body = payload.contents?.fr || payload.contents?.en || '';
+  if (!title && !body) return;
+
+  await Promise.allSettled(
+    Array.from(ids).map(async (uid) => {
+      const userDoc = await db.collection('users').doc(uid).get();
+      if (!userDoc.exists) return;
+      const userData = userDoc.data() || {};
+      if (userData.notificationsEnabled === false) return;
+      if (!userData.email) return;
+
+      await sendBrevoEmail({
+        to: userData.email,
+        toName: userData.name || userData.displayName,
+        title,
+        body,
+      });
+    })
+  );
+}
+
+// ---------------------------
 // Helper: call Genius Pay API
 // ---------------------------
 async function createGeniusPayPayment(data) {
@@ -3184,17 +3294,19 @@ app.post('/notifications/push', async (req, res) => {
 
     const payload = { ...(req.body || {}), app_id: ONESIGNAL_APP_ID };
 
-    const oneSignalResponse = await fetch(
-      'https://onesignal.com/api/v1/notifications',
-      {
+    const [oneSignalResponse] = await Promise.all([
+      fetch('https://onesignal.com/api/v1/notifications', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
           Authorization: `Basic ${process.env.ONESIGNAL_REST_API_KEY}`,
         },
         body: JSON.stringify(payload),
-      }
-    );
+      }),
+      // Double canal : email Brevo en parallele du push, best-effort (voir
+      // sendEmailsForPushPayload). N'affecte jamais la reponse ci-dessous.
+      sendEmailsForPushPayload(payload),
+    ]);
 
     const data = await oneSignalResponse.json().catch(() => ({}));
     res.status(oneSignalResponse.status).json(data);

@@ -338,6 +338,10 @@ const SUBSCRIPTION_PLANS = {
   'Annuel - Option 1': { paymentKind: 'subscription', group: 'seller', key: 'annuel', days: 365, couponPlanType: 'annual' },
   'Annuel - Option 2': { paymentKind: 'subscription', group: 'seller', key: 'annuel', days: 365, couponPlanType: 'annual' },
   'driver_monthly': { paymentKind: 'driver_subscription', group: 'driver', key: 'mensuel', days: 30, couponPlanType: null },
+  // Espace de travail (workspace_subscription_screen.dart) -- workspacePlan
+  // est la valeur ecrite dans workspaces/{id}.plan, deja lue par l'app.
+  'workspace_personal': { paymentKind: 'workspace_subscription', group: 'workspace', key: 'personnel', days: 30, couponPlanType: null, workspacePlan: 'personal' },
+  'workspace_enterprise': { paymentKind: 'workspace_subscription', group: 'workspace', key: 'enterprise', days: 30, couponPlanType: null, workspacePlan: 'enterprise' },
 };
 
 async function getPlanPrice(plan) {
@@ -405,11 +409,22 @@ app.post('/subscription/checkout', async (req, res) => {
     const decoded = await requireAuth(req);
     if (!db) return res.status(503).json({ error: 'firestore not configured' });
 
-    const { planName, couponId } = req.body || {};
+    const { planName, couponId, workspaceId } = req.body || {};
     const plan = SUBSCRIPTION_PLANS[planName];
     if (!plan) return res.status(400).json({ error: 'unknown planName' });
     if (couponId && !plan.couponPlanType) {
       return res.status(400).json({ error: 'coupons not accepted for this plan' });
+    }
+
+    // Abonnement d'espace de travail : seul le titulaire de l'espace paie.
+    // L'espace doit deja exister (cree par l'app, sans champs de plan --
+    // firestore.rules les reserve au serveur).
+    if (plan.paymentKind === 'workspace_subscription') {
+      if (!workspaceId) return res.status(400).json({ error: 'workspaceId required' });
+      const ws = await db.collection('workspaces').doc(String(workspaceId)).get();
+      if (!ws.exists || ws.data().ownerId !== decoded.uid) {
+        return res.status(404).json({ error: 'workspace not found' });
+      }
     }
 
     const basePrice = await getPlanPrice(plan);
@@ -428,6 +443,7 @@ app.post('/subscription/checkout', async (req, res) => {
       discountAmount: discount,
       amount,
       couponId: validCouponId,
+      ...(plan.paymentKind === 'workspace_subscription' ? { workspaceId: String(workspaceId) } : {}),
       currency: 'XOF',
       paymentMethod: testMode || amount === 0 ? 'Genius Pay (Mode Test)' : 'Genius Pay',
       paymentStatus: 'awaiting_checkout',
@@ -712,7 +728,7 @@ app.post('/webhook/genius-pay', async (req, res) => {
     const status = txData.status;
     const metadata = txData.metadata || {};
 
-    if (metadata.paymentKind === 'subscription' || metadata.paymentKind === 'driver_subscription') {
+    if (['subscription', 'driver_subscription', 'workspace_subscription'].includes(metadata.paymentKind)) {
       await handleSubscriptionPaymentUpdate(status, metadata, txData.amount);
     } else if (metadata.paymentKind === 'order') {
       await handleOrderWebhook(status, metadata, txData.amount);
@@ -795,11 +811,15 @@ async function completeSubscriptionPayment(metadata, paidAmount) {
   }
 
   const isDriver = payment.paymentKind === 'driver_subscription';
+  const isWorkspace = payment.paymentKind === 'workspace_subscription';
   const userId = payment.userId;
-  const targetRef = isDriver
-    ? db.collection('public_drivers').doc(userId)
-    : db.collection('users').doc(userId);
-  const expiryField = isDriver ? 'subscriptionExpiresAt' : 'subscriptionDate';
+  const targetRef = isWorkspace
+    ? db.collection('workspaces').doc(payment.workspaceId)
+    : isDriver
+      ? db.collection('public_drivers').doc(userId)
+      : db.collection('users').doc(userId);
+  const expiryField = isWorkspace || isDriver ? 'subscriptionExpiresAt' : 'subscriptionDate';
+  const workspacePlan = isWorkspace ? SUBSCRIPTION_PLANS[payment.planName]?.workspacePlan : null;
 
   const result = await db.runTransaction(async (tx) => {
     const fresh = await tx.get(paymentRef);
@@ -813,12 +833,28 @@ async function completeSubscriptionPayment(metadata, paidAmount) {
     // d'expiration au lieu de repartir de maintenant.
     const now = Date.now();
     const existingExpiry = targetSnap.data()?.[expiryField];
-    const baseTime = existingExpiry && existingExpiry.toDate().getTime() > now
+    // Espace de travail : on ne cumule que sur la MEME formule -- sinon les
+    // jours restants d'une formule Personnel deviendraient des jours
+    // Entreprise.
+    const canStack = !isWorkspace || targetSnap.data()?.plan === workspacePlan;
+    const baseTime = canStack && existingExpiry && existingExpiry.toDate().getTime() > now
       ? existingExpiry.toDate().getTime()
       : now;
     const expiryDate = new Date(baseTime + Number(payment.days) * 24 * 60 * 60 * 1000);
 
-    if (isDriver) {
+    if (isWorkspace) {
+      if (!targetSnap.exists || !workspacePlan) throw new Error('WORKSPACE_NOT_FOUND');
+      // planUpdatedAt + subscriptionDurationDays restent coherents avec
+      // subscriptionExpiresAt pour les versions de l'app qui calculent
+      // encore l'expiration a partir de ces deux champs.
+      tx.update(targetRef, {
+        plan: workspacePlan,
+        planUpdatedAt: admin.firestore.Timestamp.fromMillis(now),
+        subscriptionDurationDays: Math.ceil((expiryDate.getTime() - now) / (24 * 60 * 60 * 1000)),
+        subscriptionExpiresAt: admin.firestore.Timestamp.fromDate(expiryDate),
+        subscriptionCancelled: false,
+      });
+    } else if (isDriver) {
       tx.update(targetRef, {
         subscriptionActive: true,
         subscriptionExpiresAt: admin.firestore.Timestamp.fromDate(expiryDate),
@@ -857,6 +893,10 @@ async function completeSubscriptionPayment(metadata, paidAmount) {
 
   if (isDriver) {
     console.log(`✅ Abonnement livreur confirmé pour ${userId}, expire le ${result.toISOString()}`);
+    return true;
+  }
+  if (isWorkspace) {
+    console.log(`✅ Abonnement espace ${payment.workspaceId} (${workspacePlan}) confirmé, expire le ${result.toISOString()}`);
     return true;
   }
 
@@ -1318,7 +1358,7 @@ app.post('/transaction/confirm/:reference', async (req, res) => {
     const status = txData.status;
     const metadata = txData.metadata || {};
 
-    if (metadata.paymentKind === 'subscription' || metadata.paymentKind === 'driver_subscription') {
+    if (['subscription', 'driver_subscription', 'workspace_subscription'].includes(metadata.paymentKind)) {
       if (metadata.userId !== decoded.uid) {
         return res.status(403).json({ error: 'not your payment' });
       }
@@ -1792,7 +1832,7 @@ app.post('/payment/grant-test-mode', async (req, res) => {
 
     // Abonnements : plus acceptes ici (planName/days venaient du client) --
     // /subscription/checkout gere lui-meme le mode test (2026-09-27).
-    if (paymentKind === 'subscription' || paymentKind === 'driver_subscription') {
+    if (['subscription', 'driver_subscription', 'workspace_subscription'].includes(paymentKind)) {
       return res.status(400).json({ error: 'use /subscription/checkout for subscriptions' });
     } else if (['order', 'campaign', 'service_order'].includes(paymentKind)) {
       // Propriete et etat verifies sur le document reel (loadPayableTarget),

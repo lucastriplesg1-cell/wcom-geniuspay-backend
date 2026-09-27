@@ -310,10 +310,189 @@ async function notifyBuyersPush(buyerIds, title, message, data) {
 }
 
 // ---------------------------
+// Tarifs des abonnements -- source de verite : Firestore config/pricing,
+// modifiable depuis la console Firebase sans toucher au code ni publier une
+// nouvelle version de l'app (demande du 2026-09-27). L'app lit le meme
+// document pour l'AFFICHAGE, mais seul ce serveur decide du montant facture :
+// avant, le client envoyait lui-meme amount/planName/days a /payment et
+// n'importe qui pouvait payer 100 FCFA un abonnement Annuel.
+//
+// Un tarif absent du document retombe sur DEFAULT_PRICING ; un tarif present
+// mais invalide (texte, negatif...) fait echouer le paiement plutot que de
+// facturer un montant inattendu.
+// ---------------------------
+const DEFAULT_PRICING = {
+  seller: { mensuel: 5000, trimestriel: 13500, annuel: 50000 },
+  driver: { mensuel: 2500 },
+  // Pas encore facture (espace de travail en mode test) -- present pour
+  // que la structure soit prete le jour ou le paiement sera branche.
+  workspace: { personnel: 0, enterprise: 0 },
+};
+
+// planName (identifiant canonique stocke dans users.currentPlan, voir
+// subscription_screen.dart) -> tarif et duree. La duree reste fixee ici :
+// elle correspond au nom du plan affiche ("Mensuel" = 30 jours).
+const SUBSCRIPTION_PLANS = {
+  'Mensuel': { paymentKind: 'subscription', group: 'seller', key: 'mensuel', days: 30, couponPlanType: 'monthly' },
+  'Trimestriel': { paymentKind: 'subscription', group: 'seller', key: 'trimestriel', days: 90, couponPlanType: 'quarterly' },
+  'Annuel - Option 1': { paymentKind: 'subscription', group: 'seller', key: 'annuel', days: 365, couponPlanType: 'annual' },
+  'Annuel - Option 2': { paymentKind: 'subscription', group: 'seller', key: 'annuel', days: 365, couponPlanType: 'annual' },
+  'driver_monthly': { paymentKind: 'driver_subscription', group: 'driver', key: 'mensuel', days: 30, couponPlanType: null },
+};
+
+async function getPlanPrice(plan) {
+  const snap = await db.collection('config').doc('pricing').get();
+  const raw = snap.exists ? snap.data()?.[plan.group]?.[plan.key] : undefined;
+  if (raw === undefined || raw === null) {
+    return DEFAULT_PRICING[plan.group][plan.key];
+  }
+  const price = Number(raw);
+  if (!Number.isInteger(price) || price < 0) {
+    const err = new Error(`config/pricing.${plan.group}.${plan.key} invalide : ${JSON.stringify(raw)}`);
+    err.statusCode = 500;
+    throw err;
+  }
+  return price;
+}
+
+// Meme regles que l'ancien calcul client (payment_screen.dart::_getPlanAmount),
+// mais sur le document Firestore reel -- jamais sur un coupon envoye par le
+// client. Retourne { discount, couponId } ; leve une erreur 400 si le coupon
+// n'est pas utilisable.
+async function computeCouponDiscount(couponId, uid, plan, basePrice) {
+  if (!couponId) return { discount: 0, couponId: null };
+  const snap = await db.collection('coupons').doc(String(couponId)).get();
+  const coupon = snap.data();
+  const reject = (msg) => {
+    const err = new Error(msg);
+    err.statusCode = 400;
+    return err;
+  };
+  if (!snap.exists || coupon.userId !== uid) throw reject('coupon introuvable');
+  if (coupon.isUsed === true) throw reject('coupon deja utilise');
+  if (coupon.expiryDate && coupon.expiryDate.toDate().getTime() < Date.now()) {
+    throw reject('coupon expire');
+  }
+  if (coupon.planType && coupon.planType !== 'any' && coupon.planType !== plan.couponPlanType) {
+    throw reject('coupon non applicable a ce plan');
+  }
+
+  let discount = 0;
+  if (coupon.discountPercent != null) {
+    discount = Math.floor((basePrice * Number(coupon.discountPercent)) / 100);
+    if (coupon.maxDiscount != null) discount = Math.min(discount, Number(coupon.maxDiscount));
+  } else if (coupon.discountAmount != null) {
+    discount = Number(coupon.discountAmount);
+  }
+  if (!Number.isFinite(discount) || discount < 0) discount = 0;
+  return { discount: Math.min(discount, basePrice), couponId: snap.id };
+}
+
+// ---------------------------
+// Creation d'un paiement d'abonnement (vendeur ou livreur). Le client
+// n'envoie QUE { planName, couponId? } : le serveur calcule le montant,
+// cree lui-meme subscriptionPayments/{id} (Admin SDK, serverPriced: true --
+// firestore.rules interdit desormais cette creation cote client) et ouvre le
+// paiement Genius Pay. Le webhook et /transaction/confirm relisent ensuite
+// plan/duree/montant depuis ce document, jamais depuis la metadata.
+//
+// Reponse : { status: 'completed' } si rien a payer (mode test serveur ou
+// coupon a 100 %), sinon { status: 'pending', checkout_url, reference,
+// subscriptionPaymentId, amount }.
+// ---------------------------
+app.post('/subscription/checkout', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const { planName, couponId } = req.body || {};
+    const plan = SUBSCRIPTION_PLANS[planName];
+    if (!plan) return res.status(400).json({ error: 'unknown planName' });
+    if (couponId && !plan.couponPlanType) {
+      return res.status(400).json({ error: 'coupons not accepted for this plan' });
+    }
+
+    const basePrice = await getPlanPrice(plan);
+    const { discount, couponId: validCouponId } =
+      await computeCouponDiscount(couponId, decoded.uid, plan, basePrice);
+    const amount = basePrice - discount;
+    const testMode = process.env.PAYMENTS_DISABLED === 'true';
+
+    const paymentRef = db.collection('subscriptionPayments').doc();
+    await paymentRef.set({
+      userId: decoded.uid,
+      paymentKind: plan.paymentKind,
+      planName,
+      days: plan.days,
+      basePrice,
+      discountAmount: discount,
+      amount,
+      couponId: validCouponId,
+      currency: 'XOF',
+      paymentMethod: testMode || amount === 0 ? 'Genius Pay (Mode Test)' : 'Genius Pay',
+      paymentStatus: 'awaiting_checkout',
+      serverPriced: true,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const metadata = {
+      paymentKind: plan.paymentKind,
+      userId: decoded.uid,
+      subscriptionPaymentId: paymentRef.id,
+    };
+
+    // PAYMENTS_DISABLED : Genius Pay facture reellement meme en "mode test"
+    // cote leur API -- on accorde directement, sans jamais l'appeler.
+    if (testMode || amount === 0) {
+      await completeSubscriptionPayment(metadata, null);
+      return res.json({ status: 'completed', subscriptionPaymentId: paymentRef.id, amount });
+    }
+
+    const geniusResponse = await createGeniusPayPayment({
+      order_id: paymentRef.id,
+      email: decoded.email || `${decoded.uid}@wcom.local`,
+      amount,
+      currency: 'XOF',
+      metadata,
+    });
+    const data = geniusResponse?.data || geniusResponse || {};
+    const checkoutUrl = data.checkout_url || data.payment_url;
+    const reference = data.reference || (data.id != null ? String(data.id) : null);
+    if (!checkoutUrl || !reference) {
+      throw new Error(`Invalid response from Genius Pay: ${JSON.stringify(geniusResponse)}`);
+    }
+
+    await paymentRef.update({
+      paymentStatus: 'checkout_started',
+      paymentReference: reference,
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({
+      status: 'pending',
+      checkout_url: checkoutUrl,
+      reference,
+      subscriptionPaymentId: paymentRef.id,
+      amount,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+// ---------------------------
 // Public endpoint for your app
 // ---------------------------
 app.post('/payment', async (req, res) => {
   try {
+    // Les abonnements passent obligatoirement par /subscription/checkout
+    // (prix calcule cote serveur depuis config/pricing) -- ici le montant
+    // vient du client, on refuse donc ces paymentKind.
+    const kind = req.body?.metadata?.paymentKind;
+    if (kind === 'subscription' || kind === 'driver_subscription') {
+      return res.status(400).json({ error: 'use /subscription/checkout for subscriptions' });
+    }
     // Forward the request body directly (you may want validation in production)
     const geniusResponse = await createGeniusPayPayment(req.body);
     res.json(geniusResponse);
@@ -404,10 +583,8 @@ app.post('/webhook/genius-pay', async (req, res) => {
     const status = txData.status;
     const metadata = txData.metadata || {};
 
-    if (metadata.paymentKind === 'subscription') {
-      await handleSubscriptionWebhook(status, metadata);
-    } else if (metadata.paymentKind === 'driver_subscription') {
-      await handleDriverSubscriptionWebhook(status, metadata);
+    if (metadata.paymentKind === 'subscription' || metadata.paymentKind === 'driver_subscription') {
+      await handleSubscriptionPaymentUpdate(status, metadata, txData.amount);
     } else if (metadata.paymentKind === 'order') {
       await handleOrderWebhook(status, metadata);
     } else if (metadata.paymentKind === 'campaign') {
@@ -422,52 +599,137 @@ app.post('/webhook/genius-pay', async (req, res) => {
   }
 });
 
-async function handleSubscriptionWebhook(status, metadata) {
-  const { userId, planName, days, subscriptionPaymentId } = metadata;
-  if (!userId) {
-    console.error('âŒ Webhook abonnement sans userId dans metadata');
-    return;
-  }
-
-  if (subscriptionPaymentId) {
-    await db
-      .collection('subscriptionPayments')
-      .doc(subscriptionPaymentId)
-      .update({
-        paymentStatus: status === 'completed' ? 'completed' : status,
-        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-      })
-      .catch((e) => console.error('subscriptionPayments update failed:', e.message));
+// ---------------------------
+// Confirmation d'un paiement d'abonnement (vendeur 'subscription' ou livreur
+// 'driver_subscription') -- appele par le webhook Genius Pay,
+// /transaction/confirm (bouton "J'ai paye") et /subscription/checkout (mode
+// test / montant nul).
+//
+// Refonte du 2026-09-27 (tarifs pilotes par config/pricing) :
+// - plan, duree et montant sont relus depuis subscriptionPayments/{id}
+//   (cree par /subscription/checkout, serverPriced: true), jamais depuis la
+//   metadata -- que le client pouvait fabriquer via /payment ;
+// - si Genius Pay rapporte un montant paye inferieur au montant attendu,
+//   rien n'est accorde ;
+// - idempotent : le webhook ET la confirmation manuelle appelaient chacun
+//   l'ancien handler, et chaque appel rallongeait l'abonnement -- un seul
+//   paiement pouvait donc crediter deux fois la duree. La transaction
+//   ci-dessous ne credite que si le paiement n'est pas deja 'completed'.
+// - le coupon est consomme et le bonus Trimestriel (-10 %) accorde ici,
+//   cote serveur -- les regles Firestore n'autorisent plus le client a
+//   creer ou modifier des coupons.
+// ---------------------------
+async function handleSubscriptionPaymentUpdate(status, metadata, paidAmount) {
+  const paymentId = metadata?.subscriptionPaymentId;
+  if (!paymentId) {
+    console.error('❌ Paiement abonnement sans subscriptionPaymentId dans metadata:', metadata);
+    return false;
   }
 
   if (status !== 'completed') {
-    console.log(`â„¹ï¸ Paiement abonnement ${userId} : statut ${status}, aucun changement d'accÃ¨s`);
-    return;
-  }
-
-  // Renouvellement anticipÃ© : si l'abonnement en cours n'est pas encore
-  // expirÃ©, les nouveaux jours s'ajoutent Ã  sa date d'expiration au lieu de
-  // repartir de maintenant -- sinon un vendeur qui renouvelle quelques jours
-  // avant l'Ã©chÃ©ance perdait les jours restants dÃ©jÃ  payÃ©s (signalÃ©
-  // 2026-09-08, KPI Abonnement).
-  const now = Date.now();
-  let baseTime = now;
-  try {
-    const userSnap = await db.collection('users').doc(userId).get();
-    const existingExpiry = userSnap.data()?.subscriptionDate;
-    if (existingExpiry && existingExpiry.toDate().getTime() > now) {
-      baseTime = existingExpiry.toDate().getTime();
+    const ref = db.collection('subscriptionPayments').doc(String(paymentId));
+    const snap = await ref.get();
+    if (snap.exists && snap.data().paymentStatus !== 'completed') {
+      await ref.update({
+        paymentStatus: status || 'unknown',
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      });
     }
-  } catch (e) {
-    console.error('Lecture subscriptionDate existante Ã©chouÃ©e, base = maintenant:', e.message);
+    console.log(`ℹ️ Paiement abonnement ${paymentId} : statut ${status}, aucun changement d'accès`);
+    return false;
   }
 
-  const expiryDate = new Date(baseTime + Number(days || 30) * 24 * 60 * 60 * 1000);
-  await db.collection('users').doc(userId).update({
-    isSubscribed: true,
-    currentPlan: planName,
-    subscriptionDate: admin.firestore.Timestamp.fromDate(expiryDate),
+  return completeSubscriptionPayment(metadata, paidAmount);
+}
+
+async function completeSubscriptionPayment(metadata, paidAmount) {
+  const paymentRef = db.collection('subscriptionPayments').doc(String(metadata.subscriptionPaymentId));
+  const initial = await paymentRef.get();
+  const payment = initial.data();
+
+  if (!initial.exists || payment.serverPriced !== true) {
+    console.error(`❌ Paiement abonnement ${paymentRef.id} inconnu ou non tarifé par le serveur -- rien accordé`);
+    return false;
+  }
+  if (payment.userId !== metadata.userId || payment.paymentKind !== metadata.paymentKind) {
+    console.error(`❌ Paiement abonnement ${paymentRef.id} : metadata incohérente avec le document -- rien accordé`);
+    return false;
+  }
+  if (paidAmount != null && Number.isFinite(Number(paidAmount)) && Number(paidAmount) < payment.amount) {
+    console.error(`🚨 Paiement abonnement ${paymentRef.id} : payé ${paidAmount}, attendu ${payment.amount} -- rien accordé`);
+    await paymentRef.update({
+      paymentStatus: 'amount_mismatch',
+      paidAmount: Number(paidAmount),
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return false;
+  }
+
+  const isDriver = payment.paymentKind === 'driver_subscription';
+  const userId = payment.userId;
+  const targetRef = isDriver
+    ? db.collection('public_drivers').doc(userId)
+    : db.collection('users').doc(userId);
+  const expiryField = isDriver ? 'subscriptionExpiresAt' : 'subscriptionDate';
+
+  const result = await db.runTransaction(async (tx) => {
+    const fresh = await tx.get(paymentRef);
+    if (fresh.data().paymentStatus === 'completed') return null; // deja accorde
+    const targetSnap = await tx.get(targetRef);
+    const couponRef = payment.couponId ? db.collection('coupons').doc(payment.couponId) : null;
+    const couponSnap = couponRef ? await tx.get(couponRef) : null;
+
+    // Renouvellement anticipé (2026-09-08) : si l'abonnement en cours n'est
+    // pas encore expiré, les nouveaux jours s'ajoutent à sa date
+    // d'expiration au lieu de repartir de maintenant.
+    const now = Date.now();
+    const existingExpiry = targetSnap.data()?.[expiryField];
+    const baseTime = existingExpiry && existingExpiry.toDate().getTime() > now
+      ? existingExpiry.toDate().getTime()
+      : now;
+    const expiryDate = new Date(baseTime + Number(payment.days) * 24 * 60 * 60 * 1000);
+
+    if (isDriver) {
+      tx.update(targetRef, {
+        subscriptionActive: true,
+        subscriptionExpiresAt: admin.firestore.Timestamp.fromDate(expiryDate),
+      });
+    } else {
+      tx.update(targetRef, {
+        isSubscribed: true,
+        currentPlan: payment.planName,
+        subscriptionDate: admin.firestore.Timestamp.fromDate(expiryDate),
+      });
+    }
+
+    if (couponSnap && couponSnap.exists) {
+      if (couponSnap.data().isUsed === true) {
+        console.warn(`⚠️ Coupon ${couponRef.id} déjà utilisé entre-temps (paiement ${paymentRef.id})`);
+      }
+      tx.update(couponRef, {
+        isUsed: true,
+        usedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    tx.update(paymentRef, {
+      paymentStatus: 'completed',
+      ...(paidAmount != null && Number.isFinite(Number(paidAmount)) ? { paidAmount: Number(paidAmount) } : {}),
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return expiryDate;
   });
+
+  if (!result) {
+    console.log(`ℹ️ Paiement abonnement ${paymentRef.id} déjà confirmé -- ignoré`);
+    return true;
+  }
+
+  if (isDriver) {
+    console.log(`✅ Abonnement livreur confirmé pour ${userId}, expire le ${result.toISOString()}`);
+    return true;
+  }
 
   const storesSnap = await db
     .collection('stores')
@@ -478,62 +740,44 @@ async function handleSubscriptionWebhook(status, metadata) {
     await storesSnap.docs[0].ref.update({ isActive: true });
   }
 
-  console.log(`âœ… Abonnement confirmÃ© pour ${userId} (${planName}), expire le ${expiryDate.toISOString()}`);
+  if (payment.planName === 'Trimestriel') {
+    await grantQuarterlyRenewalCoupon(userId, payment.days).catch((e) =>
+      console.error('Bonus Trimestriel non accordé:', e.message),
+    );
+  }
+
+  console.log(`✅ Abonnement confirmé pour ${userId} (${payment.planName}), expire le ${result.toISOString()}`);
+  return true;
 }
 
-// Miroir de handleSubscriptionWebhook pour l'abonnement livreur (2 500
-// FCFA/mois, livreur_subscription_screen.dart) -- mÃªme logique, mais Ã©crit
-// sur public_drivers/{userId} (subscriptionActive/subscriptionExpiresAt) au
-// lieu de users/{userId} (isSubscribed/currentPlan), et n'active aucune
-// boutique. Sans ce handler, firestore.rules::public_drivers empÃªche le
-// client d'Ã©crire ces champs lui-mÃªme (audit du 2026-09-04, mÃªme faille que
-// users/{userId}.isSubscribed) : le paiement resterait indÃ©finiment Ã 
-// 'awaiting_checkout'.
-async function handleDriverSubscriptionWebhook(status, metadata) {
-  const { userId, days, subscriptionPaymentId } = metadata;
-  if (!userId) {
-    console.error('âŒ Webhook abonnement livreur sans userId dans metadata');
-    return;
-  }
-
-  if (subscriptionPaymentId) {
-    await db
-      .collection('subscriptionPayments')
-      .doc(subscriptionPaymentId)
-      .update({
-        paymentStatus: status === 'completed' ? 'completed' : status,
-        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
-      })
-      .catch((e) => console.error('subscriptionPayments update failed:', e.message));
-  }
-
-  if (status !== 'completed') {
-    console.log(`â„¹ï¸ Paiement abonnement livreur ${userId} : statut ${status}, aucun changement d'accÃ¨s`);
-    return;
-  }
-
-  // MÃªme correctif que handleSubscriptionWebhook ci-dessus (2026-09-08) :
-  // cumule sur la date d'expiration existante si elle n'est pas encore
-  // passÃ©e, au lieu d'Ã©craser les jours restants dÃ©jÃ  payÃ©s.
-  const now = Date.now();
-  let baseTime = now;
-  try {
-    const driverSnap = await db.collection('public_drivers').doc(userId).get();
-    const existingExpiry = driverSnap.data()?.subscriptionExpiresAt;
-    if (existingExpiry && existingExpiry.toDate().getTime() > now) {
-      baseTime = existingExpiry.toDate().getTime();
-    }
-  } catch (e) {
-    console.error('Lecture subscriptionExpiresAt existante Ã©chouÃ©e, base = maintenant:', e.message);
-  }
-
-  const expiryDate = new Date(baseTime + Number(days || 30) * 24 * 60 * 60 * 1000);
-  await db.collection('public_drivers').doc(userId).update({
-    subscriptionActive: true,
-    subscriptionExpiresAt: admin.firestore.Timestamp.fromDate(expiryDate),
+// Avantage Trimestriel "-10 % sur les futurs packs" -- auparavant cree par
+// le client (payment_screen.dart::_grantQuarterlyRenewalCoupon), ce qui
+// obligeait les regles Firestore a laisser n'importe quel utilisateur creer
+// ses propres coupons (y compris a -100 %).
+async function grantQuarterlyRenewalCoupon(userId, days) {
+  const alphabet = '0123456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const suffix = Array.from({ length: 6 }, () => alphabet[crypto.randomInt(alphabet.length)]).join('');
+  const code = `TRI10-${suffix}`;
+  await db.collection('coupons').add({
+    userId,
+    code,
+    discountType: 'subscription',
+    discountPercent: 10,
+    planType: 'any',
+    isUsed: false,
+    expiryDate: admin.firestore.Timestamp.fromDate(
+      new Date(Date.now() + (Number(days) + 30) * 24 * 60 * 60 * 1000),
+    ),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    source: 'quarterly_plan_perk',
   });
-
-  console.log(`âœ… Abonnement livreur confirmÃ© pour ${userId}, expire le ${expiryDate.toISOString()}`);
+  await db.collection('users').doc(userId).collection('notifications').add({
+    type: 'coupon_earned',
+    title: '🎁 Code promo -10% gagné !',
+    message: `Grâce à votre forfait Trimestriel, utilisez le code ${code} pour -10% sur votre prochain renouvellement.`,
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    read: false,
+  });
 }
 
 function isValidOrder(order) {
@@ -866,18 +1110,15 @@ app.post('/transaction/confirm/:reference', async (req, res) => {
     const status = txData.status;
     const metadata = txData.metadata || {};
 
-    if (metadata.paymentKind === 'subscription') {
+    if (metadata.paymentKind === 'subscription' || metadata.paymentKind === 'driver_subscription') {
       if (metadata.userId !== decoded.uid) {
         return res.status(403).json({ error: 'not your payment' });
       }
       if (!db) return res.status(503).json({ error: 'firestore not configured' });
-      await handleSubscriptionWebhook(status, metadata);
-    } else if (metadata.paymentKind === 'driver_subscription') {
-      if (metadata.userId !== decoded.uid) {
-        return res.status(403).json({ error: 'not your payment' });
-      }
-      if (!db) return res.status(503).json({ error: 'firestore not configured' });
-      await handleDriverSubscriptionWebhook(status, metadata);
+      const granted = await handleSubscriptionPaymentUpdate(status, metadata, txData.amount);
+      // Paye cote Genius Pay mais refuse ici (montant insuffisant, paiement
+      // non cree par /subscription/checkout...) : ne pas afficher "succes".
+      if (status === 'completed' && !granted) return res.json({ status: 'rejected' });
     } else if (metadata.paymentKind === 'order') {
       if (metadata.buyerId !== decoded.uid) {
         return res.status(403).json({ error: 'not your payment' });
@@ -1338,27 +1579,10 @@ app.post('/payment/grant-test-mode', async (req, res) => {
     const body = req.body || {};
     const paymentKind = body.paymentKind;
 
-    if (paymentKind === 'subscription') {
-      const { userId, planName, days, subscriptionPaymentId } = body;
-      if (userId !== decoded.uid) {
-        return res.status(403).json({ error: 'not your payment' });
-      }
-      await handleSubscriptionWebhook('completed', {
-        userId,
-        planName,
-        days,
-        subscriptionPaymentId,
-      });
-    } else if (paymentKind === 'driver_subscription') {
-      const { userId, days, subscriptionPaymentId } = body;
-      if (userId !== decoded.uid) {
-        return res.status(403).json({ error: 'not your payment' });
-      }
-      await handleDriverSubscriptionWebhook('completed', {
-        userId,
-        days,
-        subscriptionPaymentId,
-      });
+    // Abonnements : plus acceptes ici (planName/days venaient du client) --
+    // /subscription/checkout gere lui-meme le mode test (2026-09-27).
+    if (paymentKind === 'subscription' || paymentKind === 'driver_subscription') {
+      return res.status(400).json({ error: 'use /subscription/checkout for subscriptions' });
     } else if (paymentKind === 'order') {
       const { orderId, buyerId, sellerId } = body;
       if (buyerId !== decoded.uid) {
@@ -3727,6 +3951,24 @@ app.post('/api/cloudinary/sign-upload', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error during signing' });
   }
 });
+
+// Cree config/pricing avec les tarifs actuels s'il n'existe pas encore --
+// create() echoue si le document existe, donc les prix modifies depuis la
+// console Firebase ne sont jamais ecrases.
+async function seedPricingConfig() {
+  if (!db) return;
+  try {
+    await db.collection('config').doc('pricing').create({
+      ...DEFAULT_PRICING,
+      currency: 'XOF',
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log('✅ config/pricing créé avec les tarifs par défaut');
+  } catch (e) {
+    if (e.code !== 6) console.error('Seed config/pricing échoué:', e.message); // 6 = ALREADY_EXISTS
+  }
+}
+seedPricingConfig();
 
 app.listen(PORT, () => {
   console.log(`ðŸš€ Server listening on port ${PORT}`);

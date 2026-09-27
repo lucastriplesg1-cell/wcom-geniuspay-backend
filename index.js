@@ -335,6 +335,9 @@ const DEFAULT_PRICING = {
 const SUBSCRIPTION_PLANS = {
   'Mensuel': { paymentKind: 'subscription', group: 'seller', key: 'mensuel', days: 30, couponPlanType: 'monthly' },
   'Trimestriel': { paymentKind: 'subscription', group: 'seller', key: 'trimestriel', days: 90, couponPlanType: 'quarterly' },
+  'Annuel': { paymentKind: 'subscription', group: 'seller', key: 'annuel', days: 365, couponPlanType: 'annual' },
+  // Anciennes options "frais de service" (idee abandonnee le 2026-09-27) --
+  // gardees pour les versions de l'app qui les envoient encore.
   'Annuel - Option 1': { paymentKind: 'subscription', group: 'seller', key: 'annuel', days: 365, couponPlanType: 'annual' },
   'Annuel - Option 2': { paymentKind: 'subscription', group: 'seller', key: 'annuel', days: 365, couponPlanType: 'annual' },
   'driver_monthly': { paymentKind: 'driver_subscription', group: 'driver', key: 'mensuel', days: 30, couponPlanType: null },

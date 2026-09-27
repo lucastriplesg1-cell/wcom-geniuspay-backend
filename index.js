@@ -482,24 +482,153 @@ app.post('/subscription/checkout', async (req, res) => {
 });
 
 // ---------------------------
-// Public endpoint for your app
+// Paiement d'une commande, d'une campagne ou d'une prestation (2026-09-27).
+// Meme principe que /subscription/checkout : le client dit QUOI il paie, le
+// serveur lit le montant dans le document Firestore correspondant. Avant,
+// le client envoyait lui-meme `amount` a /payment -- il pouvait payer 100
+// FCFA une commande de 50 000, ou une campagne dont la mise en avant depend
+// du budget declare.
+//
+// Corps : { paymentKind: 'order', orderId }
+//       | { paymentKind: 'campaign', campaignId }
+//       | { paymentKind: 'service_order', workspaceId, serviceOrderId }
+// Reponse : { status: 'completed' } en mode test serveur, sinon
+// { status: 'pending', checkout_url, reference, amount }.
 // ---------------------------
-app.post('/payment', async (req, res) => {
-  try {
-    // Les abonnements passent obligatoirement par /subscription/checkout
-    // (prix calcule cote serveur depuis config/pricing) -- ici le montant
-    // vient du client, on refuse donc ces paymentKind.
-    const kind = req.body?.metadata?.paymentKind;
-    if (kind === 'subscription' || kind === 'driver_subscription') {
-      return res.status(400).json({ error: 'use /subscription/checkout for subscriptions' });
+function httpError(statusCode, message) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+}
+
+// Charge la cible du paiement, verifie que `uid` a le droit de la payer et
+// qu'elle est encore payable, et renvoie { ref, amount, metadata, handler }.
+async function loadPayableTarget(body, uid) {
+  const kind = body.paymentKind;
+
+  if (kind === 'order') {
+    if (!body.orderId) throw httpError(400, 'orderId required');
+    const ref = db.collection('orders').doc(String(body.orderId));
+    const snap = await ref.get();
+    const order = snap.data();
+    if (!snap.exists || order.buyerId !== uid) throw httpError(404, 'order not found');
+    if (order.paymentStatus === 'completed') throw httpError(409, 'order already paid');
+    if (order.status === 'cancelled') throw httpError(409, 'order cancelled');
+    return {
+      ref,
+      amount: Math.round(Number(order.totalAmount)),
+      metadata: { paymentKind: 'order', orderId: ref.id, buyerId: uid, sellerId: order.sellerId || '' },
+      handler: handleOrderWebhook,
+    };
+  }
+
+  if (kind === 'campaign') {
+    if (!body.campaignId) throw httpError(400, 'campaignId required');
+    const ref = db.collection('campaigns').doc(String(body.campaignId));
+    const snap = await ref.get();
+    const campaign = snap.data();
+    if (!snap.exists) throw httpError(404, 'campaign not found');
+    const store = await db.collection('stores').doc(String(campaign.storeId || '_')).get();
+    if (!store.exists || store.data().ownerId !== uid) throw httpError(404, 'campaign not found');
+    if (campaign.channel === 'whatsapp') throw httpError(400, 'whatsapp campaigns are free, use /campaign/confirm-free');
+    if (campaign.paymentStatus === 'completed') throw httpError(409, 'campaign already paid');
+    return {
+      ref,
+      amount: Math.round(Number(campaign.budget)),
+      metadata: { paymentKind: 'campaign', campaignId: ref.id, ownerId: uid },
+      handler: handleCampaignWebhook,
+    };
+  }
+
+  if (kind === 'service_order') {
+    if (!body.workspaceId || !body.serviceOrderId) {
+      throw httpError(400, 'workspaceId and serviceOrderId required');
     }
-    // Forward the request body directly (you may want validation in production)
-    const geniusResponse = await createGeniusPayPayment(req.body);
-    res.json(geniusResponse);
+    const ref = db.collection('workspaces').doc(String(body.workspaceId))
+      .collection('service_orders').doc(String(body.serviceOrderId));
+    const snap = await ref.get();
+    const order = snap.data();
+    if (!snap.exists || order.clientId !== uid) throw httpError(404, 'service order not found');
+    if (order.status !== 'accepted') throw httpError(409, 'service order not accepted by provider');
+    if (order.paymentStatus === 'paid') throw httpError(409, 'service order already paid');
+    return {
+      ref,
+      amount: Math.round(Number(order.price)),
+      metadata: {
+        paymentKind: 'service_order',
+        workspaceId: String(body.workspaceId),
+        serviceOrderId: ref.id,
+        clientId: uid,
+      },
+      handler: handleServiceOrderWebhook,
+    };
+  }
+
+  throw httpError(400, 'unknown paymentKind');
+}
+
+// Montant attendu d'un paiement deja lance (fige par /payment/checkout dans
+// expectedAmount) -- repli sur le montant du document pour les paiements
+// lances avant ce changement.
+function paidAmountTooLow(paidAmount, expected) {
+  if (paidAmount == null || !Number.isFinite(Number(paidAmount))) return false;
+  if (!Number.isFinite(Number(expected))) return false;
+  return Number(paidAmount) < Math.round(Number(expected));
+}
+
+app.post('/payment/checkout', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const target = await loadPayableTarget(req.body || {}, decoded.uid);
+    if (!Number.isInteger(target.amount) || target.amount <= 0) {
+      return res.status(400).json({ error: 'nothing to pay' });
+    }
+
+    if (process.env.PAYMENTS_DISABLED === 'true') {
+      await target.handler('completed', target.metadata, null);
+      return res.json({ status: 'completed', amount: target.amount });
+    }
+
+    const geniusResponse = await createGeniusPayPayment({
+      order_id: target.ref.id,
+      email: decoded.email || `${decoded.uid}@wcom.local`,
+      amount: target.amount,
+      currency: 'XOF',
+      metadata: target.metadata,
+    });
+    const data = geniusResponse?.data || geniusResponse || {};
+    const checkoutUrl = data.checkout_url || data.payment_url;
+    const reference = data.reference || (data.id != null ? String(data.id) : null);
+    if (!checkoutUrl || !reference) {
+      throw new Error(`Invalid response from Genius Pay: ${JSON.stringify(geniusResponse)}`);
+    }
+
+    const update = {
+      paymentStatus: 'checkout_started',
+      paymentReference: reference,
+      expectedAmount: target.amount,
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    // campaigns.status suit paymentStatus (voir create_campaign_screen.dart).
+    if (target.metadata.paymentKind === 'campaign') update.status = 'checkout_started';
+    await target.ref.update(update);
+
+    res.json({ status: 'pending', checkout_url: checkoutUrl, reference, amount: target.amount });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(e.statusCode || 500).json({ error: e.message });
   }
+});
+
+// ---------------------------
+// Ancien point d'entree : transmettait tel quel a Genius Pay le montant
+// choisi par le client. Tous les paiements passent desormais par
+// /subscription/checkout ou /payment/checkout (2026-09-27).
+// ---------------------------
+app.post('/payment', async (req, res) => {
+  res.status(410).json({ error: 'use /payment/checkout or /subscription/checkout' });
 });
 
 // ---------------------------
@@ -586,11 +715,11 @@ app.post('/webhook/genius-pay', async (req, res) => {
     if (metadata.paymentKind === 'subscription' || metadata.paymentKind === 'driver_subscription') {
       await handleSubscriptionPaymentUpdate(status, metadata, txData.amount);
     } else if (metadata.paymentKind === 'order') {
-      await handleOrderWebhook(status, metadata);
+      await handleOrderWebhook(status, metadata, txData.amount);
     } else if (metadata.paymentKind === 'campaign') {
-      await handleCampaignWebhook(status, metadata);
+      await handleCampaignWebhook(status, metadata, txData.amount);
     } else if (metadata.paymentKind === 'service_order') {
-      await handleServiceOrderWebhook(status, metadata);
+      await handleServiceOrderWebhook(status, metadata, txData.amount);
     } else {
       console.warn('âš ï¸ Webhook Genius Pay avec metadata.paymentKind inconnu:', metadata);
     }
@@ -793,11 +922,11 @@ function isValidOrder(order) {
   return true;
 }
 
-async function handleOrderWebhook(status, metadata) {
+async function handleOrderWebhook(status, metadata, paidAmount) {
   const { orderId, buyerId, sellerId } = metadata;
   if (!orderId) {
     console.error('❌ Webhook commande sans orderId dans metadata');
-    return;
+    return false;
   }
 
   const orderRef = db.collection('orders').doc(orderId);
@@ -810,6 +939,28 @@ async function handleOrderWebhook(status, metadata) {
         throw new Error('ORDER_NOT_FOUND');
       }
       const orderData = orderSnap.data();
+
+      // Deja payee : le webhook ET "J'ai paye" confirment la meme commande --
+      // sans ce garde-fou, la 2e confirmation remettait status a 'pending'
+      // (meme si le vendeur l'avait deja expediee) et renotifiait le vendeur,
+      // et un evenement 'failed' tardif pouvait annuler une commande payee.
+      if (orderData.paymentStatus === 'completed') {
+        sideEffects = { type: 'already_paid' };
+        return;
+      }
+
+      // Montant reellement paye inferieur au total fige par le serveur
+      // (2026-09-27) : rien n'est accorde.
+      if (status === 'completed' &&
+          paidAmountTooLow(paidAmount, orderData.expectedAmount ?? orderData.totalAmount)) {
+        transaction.update(orderRef, {
+          paymentStatus: 'amount_mismatch',
+          paidAmount: Number(paidAmount),
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        sideEffects = { type: 'amount_mismatch', expected: orderData.expectedAmount ?? orderData.totalAmount };
+        return;
+      }
 
       let newOrderData = null;
       if (status === 'completed') {
@@ -889,16 +1040,19 @@ async function handleOrderWebhook(status, metadata) {
     } else {
       console.error(`❌ Webhook commande erreur transaction: ${err.message}`);
     }
-    return;
+    return false;
   }
 
   if (sideEffects?.type === 'completed') {
     const orderData = sideEffects.orderData;
-    if (sellerId) {
+    // Vendeur/acheteur relus depuis la commande, pas depuis la metadata
+    // (fournie par le client sur /payment/grant-test-mode).
+    const notifySellerId = orderData.sellerId || sellerId;
+    if (notifySellerId) {
       const title = 'Nouvelle commande';
       const message = `${orderData.buyerName || 'Un client'} a passé une commande de ${orderData.totalAmount} CFA`;
       await db.collection('notifications').add({
-        receiverId: sellerId,
+        receiverId: notifySellerId,
         type: 'order',
         isRead: false,
         title,
@@ -906,12 +1060,13 @@ async function handleOrderWebhook(status, metadata) {
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         data: { orderId },
       }).catch(e => console.error(e));
-      await notifySellerPush(sellerId, title, message, { amount: orderData.totalAmount }).catch(e => console.error(e));
+      await notifySellerPush(notifySellerId, title, message, { amount: orderData.totalAmount }).catch(e => console.error(e));
     }
 
-    if (buyerId) {
+    const cartBuyerId = orderData.buyerId || buyerId;
+    if (cartBuyerId) {
       try {
-        const cartSnap = await db.collection('cart').where('buyerId', '==', buyerId).get();
+        const cartSnap = await db.collection('cart').where('buyerId', '==', cartBuyerId).get();
         if (!cartSnap.empty) {
           const batch = db.batch();
           cartSnap.docs.forEach((doc) => batch.delete(doc.ref));
@@ -923,11 +1078,18 @@ async function handleOrderWebhook(status, metadata) {
     }
 
     console.log(`✅ Commande ${orderId} confirmée payée`);
+    return true;
+  } else if (sideEffects?.type === 'already_paid') {
+    console.log(`ℹ️ Commande ${orderId} déjà payée -- ignoré`);
+    return true;
+  } else if (sideEffects?.type === 'amount_mismatch') {
+    console.error(`🚨 Commande ${orderId} : payé ${paidAmount}, attendu ${sideEffects.expected} -- rien accordé`);
   } else if (sideEffects?.type === 'failed') {
     console.log(`ℹ️ Commande ${orderId} : paiement ${status}, panier conservé pour réessai`);
   } else if (sideEffects?.type === 'intermediate') {
     console.log(`ℹ️ Commande ${orderId} : statut intermédiaire ${status}`);
   }
+  return false;
 }
 // Confirme le paiement d'une campagne marketing (create_campaign_screen.dart)
 // et, pour les campagnes "In-App", pose la mise en avant sur les produits de
@@ -941,29 +1103,55 @@ async function handleOrderWebhook(status, metadata) {
 // cote acheteur -- fonctionnalite inerte des deux cotes (audit du
 // 2026-09-02, corrige le 2026-09-05 une fois shop_screen.dart mis a jour
 // pour trier reellement dessus).
-async function handleCampaignWebhook(status, metadata) {
+async function handleCampaignWebhook(status, metadata, paidAmount) {
   const { campaignId } = metadata;
   if (!campaignId) {
     console.error('âŒ Webhook campagne sans campaignId dans metadata');
-    return;
+    return false;
   }
 
   const campaignRef = db.collection('campaigns').doc(campaignId);
   const campaignSnap = await campaignRef.get();
   if (!campaignSnap.exists) {
     console.error(`âŒ Webhook campagne introuvable: ${campaignId}`);
-    return;
+    return false;
   }
   const campaign = campaignSnap.data();
 
   if (status === 'completed') {
-    // 'En cours' (et non 'active') pour matcher le statut deja attendu par
-    // l'affichage existant dans marketing_screen.dart (rawStatus == 'En cours').
-    await campaignRef.update({
-      status: 'En cours',
-      paymentStatus: 'completed',
-      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    // Montant paye inferieur au budget fige par /payment/checkout
+    // (2026-09-27) : la mise en avant depend du budget, rien n'est accorde.
+    if (campaign.paymentStatus !== 'completed' &&
+        paidAmountTooLow(paidAmount, campaign.expectedAmount ?? campaign.budget)) {
+      console.error(`🚨 Campagne ${campaignId} : payé ${paidAmount}, attendu ${campaign.expectedAmount ?? campaign.budget} -- rien accordé`);
+      await campaignRef.update({
+        status: 'checkout_failed',
+        paymentStatus: 'amount_mismatch',
+        paidAmount: Number(paidAmount),
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return false;
+    }
+
+    // Une seule activation par campagne : le webhook ET "J'ai paye"
+    // confirment le meme paiement -- sans ce verrou, une campagne 'push'
+    // etait envoyee deux fois aux abonnes.
+    const claimed = await db.runTransaction(async (tx) => {
+      const fresh = await tx.get(campaignRef);
+      if (fresh.data().paymentStatus === 'completed') return false;
+      // 'En cours' (et non 'active') pour matcher le statut deja attendu par
+      // l'affichage existant dans marketing_screen.dart (rawStatus == 'En cours').
+      tx.update(campaignRef, {
+        status: 'En cours',
+        paymentStatus: 'completed',
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return true;
     });
+    if (!claimed) {
+      console.log(`ℹ️ Campagne ${campaignId} déjà activée -- ignoré`);
+      return true;
+    }
 
     if (campaign.channel === 'inapp') {
       const duration = Number(campaign.duration) || 7;
@@ -1018,7 +1206,9 @@ async function handleCampaignWebhook(status, metadata) {
     }
 
     console.log(`âœ… Campagne ${campaignId} confirmee payee`);
+    return true;
   } else if (['failed', 'cancelled', 'expired'].includes(status)) {
+    if (campaign.paymentStatus === 'completed') return true; // evenement tardif
     await campaignRef.update({
       status: 'checkout_failed',
       paymentStatus: 'checkout_failed',
@@ -1028,13 +1218,14 @@ async function handleCampaignWebhook(status, metadata) {
   } else {
     console.log(`â„¹ï¸ Campagne ${campaignId} : statut intermediaire ${status}`);
   }
+  return false;
 }
 
-async function handleServiceOrderWebhook(status, metadata) {
+async function handleServiceOrderWebhook(status, metadata, paidAmount) {
   const { workspaceId, serviceOrderId } = metadata;
   if (!workspaceId || !serviceOrderId) {
     console.error('❌ Webhook service_order sans workspaceId ou serviceOrderId');
-    return;
+    return false;
   }
 
   const orderRef = db
@@ -1046,15 +1237,31 @@ async function handleServiceOrderWebhook(status, metadata) {
   const orderSnap = await orderRef.get();
   if (!orderSnap.exists) {
     console.error(`❌ Service order introuvable: ${workspaceId}/${serviceOrderId}`);
-    return;
+    return false;
   }
 
+  const serviceOrder = orderSnap.data();
+  // Deja payee : webhook et "J'ai paye" confirment le meme paiement, et un
+  // evenement 'failed' tardif ne doit pas annuler un paiement accepte.
+  if (serviceOrder.paymentStatus === 'paid') return true;
+
   if (status === 'completed') {
+    // Montant paye inferieur au prix fige par /payment/checkout (2026-09-27).
+    if (paidAmountTooLow(paidAmount, serviceOrder.expectedAmount ?? serviceOrder.price)) {
+      console.error(`🚨 Service order ${serviceOrderId} : payé ${paidAmount}, attendu ${serviceOrder.expectedAmount ?? serviceOrder.price} -- rien accordé`);
+      await orderRef.update({
+        paymentStatus: 'amount_mismatch',
+        paidAmount: Number(paidAmount),
+        lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return false;
+    }
     await orderRef.update({
       paymentStatus: 'paid',
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
     });
     console.log(`✅ Service order ${serviceOrderId} confirmé payé`);
+    return true;
   } else if (['failed', 'cancelled', 'expired'].includes(status)) {
     await orderRef.update({
       paymentStatus: 'failed',
@@ -1062,6 +1269,7 @@ async function handleServiceOrderWebhook(status, metadata) {
     });
     console.log(`ℹ️ Service order ${serviceOrderId} : paiement ${status}`);
   }
+  return false;
 }
 
 // ---------------------------
@@ -1124,19 +1332,22 @@ app.post('/transaction/confirm/:reference', async (req, res) => {
         return res.status(403).json({ error: 'not your payment' });
       }
       if (!db) return res.status(503).json({ error: 'firestore not configured' });
-      await handleOrderWebhook(status, metadata);
+      const granted = await handleOrderWebhook(status, metadata, txData.amount);
+      if (status === 'completed' && !granted) return res.json({ status: 'rejected' });
     } else if (metadata.paymentKind === 'campaign') {
       if (metadata.ownerId !== decoded.uid) {
         return res.status(403).json({ error: 'not your payment' });
       }
       if (!db) return res.status(503).json({ error: 'firestore not configured' });
-      await handleCampaignWebhook(status, metadata);
+      const granted = await handleCampaignWebhook(status, metadata, txData.amount);
+      if (status === 'completed' && !granted) return res.json({ status: 'rejected' });
     } else if (metadata.paymentKind === 'service_order') {
-      if (metadata.clientId && metadata.clientId !== decoded.uid) {
+      if (metadata.clientId !== decoded.uid) {
         return res.status(403).json({ error: 'not your payment' });
       }
       if (!db) return res.status(503).json({ error: 'firestore not configured' });
-      await handleServiceOrderWebhook(status, metadata);
+      const granted = await handleServiceOrderWebhook(status, metadata, txData.amount);
+      if (status === 'completed' && !granted) return res.json({ status: 'rejected' });
     } else {
       return res.status(400).json({ error: 'unknown paymentKind in metadata' });
     }
@@ -1583,18 +1794,12 @@ app.post('/payment/grant-test-mode', async (req, res) => {
     // /subscription/checkout gere lui-meme le mode test (2026-09-27).
     if (paymentKind === 'subscription' || paymentKind === 'driver_subscription') {
       return res.status(400).json({ error: 'use /subscription/checkout for subscriptions' });
-    } else if (paymentKind === 'order') {
-      const { orderId, buyerId, sellerId } = body;
-      if (buyerId !== decoded.uid) {
-        return res.status(403).json({ error: 'not your payment' });
-      }
-      await handleOrderWebhook('completed', { orderId, buyerId, sellerId });
-    } else if (paymentKind === 'campaign') {
-      const { campaignId, ownerId } = body;
-      if (ownerId !== decoded.uid) {
-        return res.status(403).json({ error: 'not your payment' });
-      }
-      await handleCampaignWebhook('completed', { campaignId, ownerId });
+    } else if (['order', 'campaign', 'service_order'].includes(paymentKind)) {
+      // Propriete et etat verifies sur le document reel (loadPayableTarget),
+      // pas sur buyerId/ownerId envoyes par le client (2026-09-27).
+      const target = await loadPayableTarget(body, decoded.uid);
+      const granted = await target.handler('completed', target.metadata, null);
+      if (!granted) return res.json({ status: 'rejected' });
     } else {
       return res.status(400).json({ error: 'unknown paymentKind' });
     }

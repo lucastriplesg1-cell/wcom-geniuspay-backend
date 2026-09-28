@@ -2331,7 +2331,7 @@ app.post('/ai/repos-assistant', async (req, res) => {
                 const prefixRepos = `chat_media/repos/${uid}/`;
                 
                 if (!pid.startsWith(prefixEco) && !pid.startsWith(prefixRepos)) {
-                  console.error(`Tentative d'accÃ¨s non autorisÃ© au media ${pid} par l'UID ${uid}`);
+                  console.error(`Tentative d'accès non autorisé au media ${pid} par l'UID ${uid}`);
                   const err = new Error('UNAUTHORIZED_MEDIA'); err.statusCode = 403; throw err;
                 }
                 
@@ -2340,7 +2340,7 @@ app.post('/ai/repos-assistant', async (req, res) => {
                   const err = new Error('INVALID_ASSET_NAME'); err.statusCode = 400; throw err;
                 }
 
-                // 2. Fetch sÃ©curisÃ© et gestion des erreurs Cloudinary (Fail-Closed sans falsifier le prompt)
+                // 2. Fetch sécurisé et gestion des erreurs Cloudinary (Fail-Closed sans falsifier le prompt)
                 try {
                   const url = cloudinary.url(pid, {
                     type: 'authenticated',
@@ -2510,15 +2510,15 @@ app.post('/ai/repos-assistant', async (req, res) => {
             productId: doc.id,
             productName: name,
             reason: 'Stock dormant (aucune vente depuis 30 jours)',
-            suggestion: 'CrÃ©er une promotion ciblÃ©e (-15%)'
+            suggestion: 'Créer une promotion ciblée (-15%)'
           });
         }
       } else if (salesLast30Days >= 10) {
         smartPricing.push({
           productId: doc.id,
           productName: name,
-          reason: `Produit trÃ¨s demandÃ© (${salesLast30Days} ventes ces 30 derniers jours)`,
-          suggestion: 'Augmenter lÃ©gÃ¨rement le prix (+5%)'
+          reason: `Produit très demandé (${salesLast30Days} ventes ces 30 derniers jours)`,
+          suggestion: 'Augmenter légèrement le prix (+5%)'
         });
       }
     }
@@ -2527,7 +2527,7 @@ app.post('/ai/repos-assistant', async (req, res) => {
     
     const recentOrders = recentOrdersDocs.map(doc => {
       const data = doc.data();
-      return `- Commande ID=${doc.id}, Client=${data.customerName || 'Inconnu'}, Total=${Number(data.totalAmount)||0} CFA, Statut=${data.status||'pending'}, Livreur=${data.livreurName||'Non assignÃ©'}`;
+      return `- Commande ID=${doc.id}, Client=${data.customerName || 'Inconnu'}, Total=${Number(data.totalAmount)||0} CFA, Statut=${data.status||'pending'}, Livreur=${data.livreurName||'Non assigné'}`;
     }).join("\n");
 
     const actualDrivers = driversSnap.empty ? driversBySellerSnap.docs : driversSnap.docs;
@@ -2538,24 +2538,24 @@ app.post('/ai/repos-assistant', async (req, res) => {
 
     const storeContext = `CONTEXTE BOUTIQUE :
 - Nom : ${storeData.storeName || 'Ma Boutique'}
-- CatÃ©gorie : ${storeData.category || 'GÃ©nÃ©ral'}
-- Ville : ${storeData.commune || 'Non spÃ©cifiÃ©e'}
+- Catégorie : ${storeData.category || 'Général'}
+- Ville : ${storeData.commune || 'Non spécifiée'}
 - Note : ${Number(storeData.averageRating)||0}/5 (${Number(storeData.reviewCount)||0} avis)
 
 PERFORMANCES GLOBALES (30 JOURS) :
 - CA Total : ${totalRevenue.toFixed(0)} CFA
 - Commandes : ${totalOrders}
 
-CATALOGUE DÃ‰TAILLÃ‰ (Prix, Stocks et Ventes) :
+CATALOGUE DÉTAILLÉ (Prix, Stocks et Ventes) :
 ${detailedProducts.map(p => `- ${p.nom} : ID=${p.id}, Prix=${p.prix} CFA, Stock=${p.stock_actuel}, Ventes=${p.ventes_30j}, CA=${p.ca_30j} CFA`).join("\n")}
 
-COMMANDES RÃ‰CENTES (10 derniÃ¨res) :
+COMMANDES RÉCENTES (10 dernières) :
 ${recentOrders}
 
 LISTE DES LIVREURS :
 ${availableDrivers}
 
-AVIS RÃ‰CENTS :
+AVIS RÉCENTS :
 ${recentReviews}`;
 
     const insightsText = JSON.stringify({
@@ -2587,51 +2587,54 @@ YOUR NEW AUTONOMOUS CAPABILITIES:
    - Send Campaign: [ACTION:SEND_CAMPAIGN:discount:promoCode]
 RULES:
 - Be PROACTIVE. Mention alerts without being asked.
+- Only write an [ACTION:...] tag when you are actually proposing that change now, with a real ID from the STORE DATA and a real value. NEVER put a tag in an explanation or an example: describe what you can do in plain words.
 - Always reply in English.`;
-    } else if (language === "EspaÃ±ol") {
-      systemPrompt = `Eres Repos, el asistente de comercio electrÃ³nico autÃ³nomo y proactivo de W-COM.
+    } else if (language === "Español") {
+      systemPrompt = `Eres Repos, el asistente de comercio electrónico autónomo y proactivo de W-COM.
 [DATOS DE TIENDA]
 ${storeContext}
-[INFORMACIÃ“N INTELIGENTE (JSON)]
+[INFORMACIÓN INTELIGENTE (JSON)]
 ${insightsText}
-TUS NUEVAS CAPACIDADES AUTÃ“NOMAS:
-1. PrevisiÃ³n de stock: Analiza 'stockAlerts' para prevenir la falta de stock.
+TUS NUEVAS CAPACIDADES AUTÓNOMAS:
+1. Previsión de stock: Analiza 'stockAlerts' para prevenir la falta de stock.
 2. Smart Pricing: Utiliza 'smartPricing' para sugerir promociones dirigidas en inventario inactivo o sugerir aumentar los precios ligeramente.
 3. Briefing: Utiliza 'dailyBriefing' para resumir el rendimiento.
-4. CampaÃ±a de Marketing: Analiza 'inactiveClientsCount'. Si > 0, propone proactivamente enviar una campaÃ±a.
-5. ACCIONES DE EDICIÃ“N (MUY IMPORTANTE):
-   Utiliza el formato especial [ACTION:TYPE:ID:VALUE] en tu respuesta para activar la ejecuciÃ³n:
+4. Campaña de Marketing: Analiza 'inactiveClientsCount'. Si > 0, propone proactivamente enviar una campaña.
+5. ACCIONES DE EDICIÓN (MUY IMPORTANTE):
+   Utiliza el formato especial [ACTION:TYPE:ID:VALUE] en tu respuesta para activar la ejecución:
    - Precio: [ACTION:UPDATE_PRICE:productId:nuevo_precio]
    - Stock: [ACTION:UPDATE_STOCK:productId:nuevo_stock]
-   - DescripciÃ³n: [ACTION:UPDATE_DESC:productId:nueva_descripcion]
+   - Descripción: [ACTION:UPDATE_DESC:productId:nueva_descripcion]
    - Estado del pedido: [ACTION:UPDATE_ORDER_STATUS:orderId:nuevo_estado]
    - Asignar repartidor: [ACTION:ASSIGN_DRIVER:orderId:driverId:nombreRepartidor]
-   - Enviar campaÃ±a: [ACTION:SEND_CAMPAIGN:descuento:cÃ³digoPromo]
+   - Enviar campaña: [ACTION:SEND_CAMPAIGN:descuento:códigoPromo]
 REGLAS:
-- SÃ© PROACTIVO. Si ves una alerta, menciÃ³nala.
-- Responde siempre en EspaÃ±ol.`;
+- Sé PROACTIVO. Si ves una alerta, menciónala.
+- Escribe una etiqueta [ACTION:...] SOLO cuando propongas ese cambio ahora mismo, con un ID real de los DATOS DE TIENDA y un valor real. NUNCA pongas una etiqueta en una explicación o un ejemplo: describe lo que puedes hacer con palabras.
+- Responde siempre en Español.`;
     } else {
       systemPrompt = `Tu es Repos, l'assistant e-commerce autonome et proactif de W-COM.
-[DONNÃ‰ES BOUTIQUE]
+[DONNÉES BOUTIQUE]
 ${storeContext}
 [INSIGHTS INTELLIGENTS (JSON)]
 ${insightsText}
-TES NOUVELLES CAPACITÃ‰S AUTONOMES :
-1. PrÃ©vision de stock : Analyse 'stockAlerts' pour prÃ©venir des ruptures.
-2. Smart Pricing : Utilise 'smartPricing' pour suggÃ©rer de crÃ©er des promotions sur les stocks dormants ou d'augmenter le prix.
+TES NOUVELLES CAPACITÉS AUTONOMES :
+1. Prévision de stock : Analyse 'stockAlerts' pour prévenir des ruptures.
+2. Smart Pricing : Utilise 'smartPricing' pour suggérer de créer des promotions sur les stocks dormants ou d'augmenter le prix.
 3. Briefing : Utilise 'dailyBriefing'.
 4. Campagne Marketing : Analyse 'inactiveClientsCount'. Si > 0, propose d'envoyer une campagne.
-5. ACTIONS DE MODIFICATION (TRÃˆS IMPORTANT) :
-   Utilise le format [ACTION:TYPE:ID:VALEUR] dans ta rÃ©ponse :
+5. ACTIONS DE MODIFICATION (TRÈS IMPORTANT) :
+   Utilise le format [ACTION:TYPE:ID:VALEUR] dans ta réponse :
    - Prix : [ACTION:UPDATE_PRICE:productId:nouveau_prix]
    - Stock : [ACTION:UPDATE_STOCK:productId:nouveau_stock]
    - Description : [ACTION:UPDATE_DESC:productId:nouvelle_description]
    - Statut Commande : [ACTION:UPDATE_ORDER_STATUS:orderId:nouveau_statut]
    - Assigner Livreur : [ACTION:ASSIGN_DRIVER:orderId:driverId:nomLivreur]
    - Envoyer Campagne : [ACTION:SEND_CAMPAIGN:remise:codePromo]
-RÃˆGLES :
+RÈGLES :
 - Sois PROACTIF.
-- RÃ©ponds toujours en FranÃ§ais.`;
+- N'écris une balise [ACTION:...] QUE lorsque tu proposes réellement cette modification maintenant, avec un vrai ID des DONNÉES BOUTIQUE et une vraie valeur. JAMAIS de balise dans une explication ou un exemple : décris ce que tu sais faire avec des mots.
+- Réponds toujours en Français.`;
     }
 
     const messagesForApi = [
@@ -2643,7 +2646,7 @@ RÃˆGLES :
        messagesForApi.push({
          role: "user",
          content: [
-           { type: "text", text: (language === "English" ? "Here is the image to analyze:" : "Voici l'image Ã  analyser :") },
+           { type: "text", text: (language === "English" ? "Here is the image to analyze:" : "Voici l'image à analyser :") },
            { type: "image_url", image_url: { url: image.startsWith("data:") ? image : `data:image/jpeg;base64,${image}` } }
          ]
        });
@@ -2664,7 +2667,7 @@ RÃˆGLES :
       body: JSON.stringify({
         model: 'meta/llama-3.2-90b-vision-instruct',
         messages: messagesForApi,
-        max_tokens: 500,
+        max_tokens: 900,
         temperature: 0.6,
         top_p: 0.9,
       }),

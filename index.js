@@ -1754,7 +1754,7 @@ app.post('/escrow/release', async (req, res) => {
 // Genius Pay pour renvoyer de l'argent (seules la creation et la
 // verification de paiement sont integrees), donc pas de reversement
 // automatique ici -- on enregistre la demande et, quand l'argent est
-// encore compte dans le solde du vendeur (computeAvailableBalance),
+// encore sur le solde du vendeur (seller_wallet),
 // on exclut la commande de ce calcul en la marquant 'refunded'. Le
 // virement reel au client reste, comme les retraits vendeur, un
 // traitement manuel.
@@ -1831,19 +1831,34 @@ app.post('/refund/request', async (req, res) => {
     let excludeFromBalance = !isPostRelease;
 
     if (isPostRelease) {
-      // Post-liberation, cette commande compte deja dans
-      // computeAvailableBalance (order.status === 'delivered'). On ne l'en
-      // exclut (order.status = 'refunded') que si l'argent y est encore --
-      // sinon le vendeur l'a deja retire, et la reprise doit se faire
-      // manuellement (meme logique prudente que le solde insuffisant sur
-      // /withdrawal/request).
-      const availableBalance = await computeAvailableBalance(order.sellerId);
-      if (availableBalance >= sellerDebitAmount) {
-        refundStatus = 'pending';
-        excludeFromBalance = true;
-      } else {
-        refundStatus = 'refund_pending_funds';
-      }
+      // Post-liberation (modele ledger, 2026-09-28) : l'argent a ete credite
+      // sur seller_wallet par /escrow/release. On le reprend si le solde le
+      // permet (ecriture idempotente refund:{orderId}) ; sinon le vendeur l'a
+      // deja retire et la reprise se fait manuellement.
+      const walletRef = db.collection('seller_wallet').doc(order.sellerId);
+      const ledgerRef = walletRef.collection('wallet_transactions').doc(`refund:${orderId}`);
+      const debited = await db.runTransaction(async (t) => {
+        const ledgerSnap = await t.get(ledgerRef);
+        if (ledgerSnap.exists) return true;
+        const walletSnap = await t.get(walletRef);
+        const balance = Math.round(Number(walletSnap.data()?.balance || 0));
+        const debit = Math.round(sellerDebitAmount);
+        if (!walletSnap.exists || balance < debit) return false;
+        const ts = admin.firestore.FieldValue.serverTimestamp();
+        t.update(walletRef, { balance: balance - debit, updatedAt: ts });
+        t.set(ledgerRef, {
+          idempotencyKey: ledgerRef.id,
+          type: 'refund',
+          amount: -debit,
+          reference: orderId,
+          status: 'completed',
+          actor: uid,
+          createdAt: ts,
+        });
+        return true;
+      });
+      refundStatus = debited ? 'pending' : 'refund_pending_funds';
+      excludeFromBalance = debited;
     } else {
       refundStatus = 'pending';
     }
@@ -1925,110 +1940,295 @@ app.post('/payment/grant-test-mode', async (req, res) => {
 });
 
 // ---------------------------
-// Demande de retrait -- recalcule le solde reellement disponible cote
-// serveur (Admin SDK) avant d'ecrire quoi que ce soit dans withdrawals
-// (signale par l'utilisateur 2026-09-05) : portefeuille_screen.dart
-// ecrivait auparavant directement dans Firestore, et la regle ne
-// verifiait que l'identite du vendeur, jamais que le montant demande
-// correspondait a un solde reel -- n'importe quel client pouvait donc
-// demander un retrait pour un montant arbitraire. Reprend exactement la
-// meme logique de calcul que portefeuille_screen.dart (statuts payes,
-// escrowReleasedAt, delai de 24h) pour ne jamais rejeter un retrait
-// legitime que l'ecran affiche pourtant comme disponible.
+// Portefeuille vendeur = seller_wallet (2026-09-28, choix du modele
+// "ledger") : credite par /escrow/release, debite par les retraits, les
+// tirelires et les remboursements post-liberation, chaque mouvement trace
+// dans seller_wallet/{id}/wallet_transactions avec une cle idempotente.
+// C'est aussi le solde affiche par portefeuille_screen.dart -- avant, ce
+// endpoint recalculait un autre solde a partir des commandes
+// (computeAvailableBalance) et les deux ne concordaient jamais.
 // ---------------------------
 const PAID_ORDER_STATUSES = new Set(['pay_on_delivery', 'test_mode_paid', 'completed']);
 
-async function computeAvailableBalance(sellerId) {
-  const [ordersSnap, withdrawalsSnap, vaultsSnap] = await Promise.all([
-    db.collection('orders').where('sellerId', '==', sellerId).get(),
-    db.collection('withdrawals').where('sellerId', '==', sellerId).get(),
-    db.collection('vaults').where('sellerId', '==', sellerId).get(),
-  ]);
-
-  const now = new Date();
-  let availableBalance = 0;
-
-  ordersSnap.forEach((doc) => {
-    const data = doc.data();
-    const amount = Number(data.sellerAmount ?? data.totalAmount ?? 0);
-    const status = data.status || 'pending';
-    const paymentStatus = data.paymentStatus;
-    const escrowStatus = (data.escrowStatus || 'none').toString();
-
-    if (
-      (status === 'delivered' || status === 'shipped') &&
-      !PAID_ORDER_STATUSES.has(paymentStatus)
-    ) {
-      return;
-    }
-    if (status !== 'delivered' || escrowStatus === 'in_escrow') {
-      return;
-    }
-
-    const releaseDate =
-      (data.escrowReleasedAt && data.escrowReleasedAt.toDate && data.escrowReleasedAt.toDate()) ||
-      (data.timestamp && data.timestamp.toDate && data.timestamp.toDate());
-    if (releaseDate && (now - releaseDate) / 3600000 >= 24) {
-      availableBalance += amount;
-    }
-  });
-
-  let totalWithdrawn = 0;
-  withdrawalsSnap.forEach((doc) => {
-    const data = doc.data();
-    const amount = Number(data.amount || 0);
-    const status = data.status || 'pending';
-    if (status === 'completed' || status === 'pending') {
-      totalWithdrawn += amount;
-    }
-  });
-
-  // Les tirelires reservent reellement une partie du solde (audit du
-  // 2026-09-05) : avant, une tirelire creditee par l'auto-epargne
-  // (VaultService.processAutoSave, cote client) ne deduisait jamais rien
-  // ici -- le vendeur pouvait donc retirer 100% d'une vente en plus de ce
-  // que l'app lui affichait comme "mis de cote" dans sa tirelire, le meme
-  // argent etant compte deux fois.
-  let totalInVaults = 0;
-  vaultsSnap.forEach((doc) => {
-    totalInVaults += Number(doc.data().currentAmount || 0);
-  });
-
-  return availableBalance - totalWithdrawn - totalInVaults;
+function idempotencyPart(value) {
+  const s = String(value ?? '').trim();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(s)) throw httpError(400, 'invalid operation_id');
+  return s;
 }
 
+function positiveAmount(value) {
+  const amount = Math.round(Number(value));
+  if (!Number.isFinite(amount) || amount <= 0) throw httpError(400, 'amount must be > 0');
+  return amount;
+}
+
+// Retrait vendeur : debite seller_wallet et enregistre une demande
+// 'pending', traitee manuellement (aucun virement automatique n'est
+// integre). Corps : { amount, method, accountNumber, operation_id }.
 app.post('/withdrawal/request', async (req, res) => {
   try {
     const decoded = await requireAuth(req);
     if (!db) return res.status(503).json({ error: 'firestore not configured' });
 
-    const { amount, method, accountNumber } = req.body || {};
-    const requestedAmount = Number(amount);
-    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) {
-      return res.status(400).json({ error: 'invalid amount' });
-    }
-
+    const body = req.body || {};
+    const amount = positiveAmount(body.amount);
+    const operationId = idempotencyPart(body.operation_id || crypto.randomUUID());
     const sellerId = decoded.uid;
-    const availableBalance = await computeAvailableBalance(sellerId);
+    const walletRef = db.collection('seller_wallet').doc(sellerId);
+    const ledgerRef = walletRef.collection('wallet_transactions').doc(`withdrawal:${operationId}`);
 
-    if (requestedAmount > availableBalance) {
-      return res
-        .status(409)
-        .json({ error: 'amount exceeds available balance', availableBalance });
-    }
-
-    const ref = await db.collection('withdrawals').add({
-      sellerId,
-      amount: requestedAmount,
-      status: 'pending',
-      method: method || null,
-      accountNumber: accountNumber || null,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    const result = await db.runTransaction(async (t) => {
+      const ledgerSnap = await t.get(ledgerRef);
+      if (ledgerSnap.exists) return { withdrawalId: ledgerSnap.data().reference, alreadyProcessed: true };
+      const walletSnap = await t.get(walletRef);
+      const balance = Math.round(Number(walletSnap.data()?.balance || 0));
+      if (balance < amount) {
+        const err = httpError(409, 'amount exceeds available balance');
+        err.availableBalance = balance;
+        throw err;
+      }
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      const withdrawalRef = db.collection('withdrawals').doc();
+      t.update(walletRef, { balance: balance - amount, updatedAt: now });
+      t.set(withdrawalRef, {
+        sellerId,
+        amount,
+        status: 'pending',
+        method: body.method || null,
+        accountNumber: body.accountNumber || null,
+        operationId,
+        createdAt: now,
+      });
+      t.set(ledgerRef, {
+        idempotencyKey: ledgerRef.id,
+        type: 'withdrawal',
+        amount: -amount,
+        reference: withdrawalRef.id,
+        status: 'completed',
+        actor: sellerId,
+        createdAt: now,
+      });
+      return { withdrawalId: withdrawalRef.id };
     });
 
-    res.json({ success: true, withdrawalId: ref.id });
+    res.json({ success: true, ...result });
   } catch (e) {
-    console.error(e);
+    if (!e.statusCode) console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message, availableBalance: e.availableBalance });
+  }
+});
+
+// Tirelire : depot (portefeuille -> tirelire) et retrait (tirelire ->
+// portefeuille). Porte des Cloud Functions depositVault/withdrawVault,
+// jamais deployees. Corps : { vault_id, amount, operation_id }.
+async function moveVaultFunds(req, res, direction) {
+  try {
+    const decoded = await requireAuth(req);
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const body = req.body || {};
+    const amount = positiveAmount(body.amount);
+    const operationId = idempotencyPart(body.operation_id);
+    if (!body.vault_id) throw httpError(400, 'vault_id required');
+    const uid = decoded.uid;
+    const vaultRef = db.collection('vaults').doc(String(body.vault_id));
+    const walletRef = db.collection('seller_wallet').doc(uid);
+    const key = `vault:${vaultRef.id}:${direction}:${operationId}`;
+    const walletTxRef = walletRef.collection('wallet_transactions').doc(key);
+    const vaultTxRef = vaultRef.collection('vault_transactions').doc(key);
+
+    await db.runTransaction(async (t) => {
+      const walletTxSnap = await t.get(walletTxRef);
+      if (walletTxSnap.exists) return; // deja traite
+      const vaultSnap = await t.get(vaultRef);
+      if (!vaultSnap.exists || vaultSnap.data().sellerId !== uid) throw httpError(404, 'vault not found');
+      const walletSnap = await t.get(walletRef);
+
+      const balance = Math.round(Number(walletSnap.data()?.balance || 0));
+      const inVault = Math.round(Number(vaultSnap.data().currentAmount || 0));
+      if (direction === 'deposit' && balance < amount) throw httpError(400, 'Insufficient funds in wallet');
+      if (direction === 'withdraw' && inVault < amount) throw httpError(400, 'Insufficient funds in vault');
+
+      const sign = direction === 'deposit' ? 1 : -1;
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      t.update(vaultRef, { currentAmount: inVault + sign * amount, lastUpdated: now });
+      if (walletSnap.exists) {
+        t.update(walletRef, { balance: balance - sign * amount, updatedAt: now });
+      } else {
+        t.set(walletRef, { sellerId: uid, balance: balance - sign * amount, currency: 'XOF', status: 'active', createdAt: now, updatedAt: now });
+      }
+      t.set(walletTxRef, {
+        idempotencyKey: key,
+        type: direction === 'deposit' ? 'vault_deposit' : 'vault_withdrawal',
+        amount: -sign * amount,
+        reference: vaultRef.id,
+        status: 'completed',
+        actor: uid,
+        createdAt: now,
+      });
+      t.set(vaultTxRef, {
+        idempotencyKey: key,
+        type: direction === 'deposit' ? 'wallet_transfer_in' : 'wallet_transfer_out',
+        amount: sign * amount,
+        reference: `wallet:${uid}`,
+        status: 'completed',
+        actor: uid,
+        createdAt: now,
+      });
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    if (!e.statusCode) console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+}
+app.post('/vault/deposit', (req, res) => moveVaultFunds(req, res, 'deposit'));
+app.post('/vault/withdraw', (req, res) => moveVaultFunds(req, res, 'withdraw'));
+
+// Changement de statut d'une commande par le vendeur -- porte de la Cloud
+// Function updateOrderStatus (jamais deployee), corrigee :
+//   - lectures avant ecritures (l'original lisait apres avoir ecrit dans la
+//     transaction, ce que Firestore refuse) ;
+//   - une commande sous sequestre ne peut etre ni marquee livree (PIN
+//     obligatoire, /escrow/release) ni annulee (remboursement via
+//     /refund/request) -- sinon l'argent de l'acheteur restait bloque ;
+//   - plus d'auto-epargne ici : elle debitait seller_wallet pour des
+//     commandes qui n'y avaient jamais ete creditees.
+// Corps : { orderId, status } (orderId aussi accepte en query).
+app.post('/order/status', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const orderId = req.body?.orderId || req.query.orderId;
+    const newStatus = req.body?.status;
+    if (!orderId || !newStatus) throw httpError(400, 'orderId and status required');
+    if (!['shipped', 'cancelled', 'delivered'].includes(newStatus)) throw httpError(400, 'invalid status');
+
+    const orderRef = db.collection('orders').doc(String(orderId));
+    await db.runTransaction(async (t) => {
+      const snap = await t.get(orderRef);
+      if (!snap.exists) throw httpError(404, 'order not found');
+      const order = snap.data();
+      if (order.sellerId !== decoded.uid) throw httpError(403, 'only the seller can update this order');
+      if (order.status === newStatus) return;
+      if (['delivered', 'cancelled', 'refunded'].includes(order.status)) {
+        throw httpError(409, `order already ${order.status}`);
+      }
+
+      const inEscrow = order.escrowStatus === 'in_escrow';
+      if (newStatus === 'delivered' && inEscrow) {
+        throw httpError(409, 'escrow orders are marked delivered by PIN validation');
+      }
+      if (newStatus === 'cancelled' && inEscrow) {
+        throw httpError(409, 'paid order: use the refund request instead');
+      }
+
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      const updates = { status: newStatus, lastUpdated: now };
+
+      if (newStatus === 'delivered' && order.deliveryProcessed !== true) {
+        // Commande sans sequestre (ex. payee avant l'existence du
+        // sequestre) : decrement du stock ici, comme pour le PIN.
+        const items = Array.isArray(order.items) ? order.items : [];
+        const snaps = [];
+        for (const item of items) {
+          snaps.push(item?.productId ? await t.get(db.collection('products').doc(String(item.productId))) : null);
+        }
+        items.forEach((item, i) => {
+          const qty = Number(item?.quantity) || 0;
+          if (!snaps[i]?.exists || qty <= 0) return;
+          const fresh = Number(snaps[i].data().quantity) || 0;
+          t.update(snaps[i].ref, { quantity: Math.max(0, fresh - qty), lastUpdated: now });
+        });
+        updates.deliveryProcessed = true;
+      }
+      t.update(orderRef, updates);
+    });
+
+    res.json({ success: true, message: 'Status updated' });
+  } catch (e) {
+    if (!e.statusCode) console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+// Retrait d'un espace de travail -- porte de la Cloud Function
+// requestWorkspaceWithdrawal (jamais deployee), qui ne verifiait meme pas
+// que l'appelant appartenait a l'espace. Reserve au titulaire ou a un
+// membre admin. Le solde reste celui des cash_entries de l'espace (saisies
+// par l'espace lui-meme) : la demande est 'pending' et DOIT etre verifiee
+// manuellement avant tout versement.
+// Corps : { amount, operation_id, workspace_id, destination_info,
+//           operator, fees, netPayout }.
+app.post('/workspace/withdrawal', async (req, res) => {
+  try {
+    const decoded = await requireAuth(req);
+    if (!db) return res.status(503).json({ error: 'firestore not configured' });
+
+    const body = req.body || {};
+    const amount = positiveAmount(body.amount);
+    const operationId = idempotencyPart(body.operation_id);
+    if (!body.workspace_id || !body.destination_info) throw httpError(400, 'workspace_id and destination_info required');
+    const uid = decoded.uid;
+    const wsRef = db.collection('workspaces').doc(String(body.workspace_id));
+
+    const [wsSnap, memberSnap] = await Promise.all([wsRef.get(), wsRef.collection('members').doc(uid).get()]);
+    if (!wsSnap.exists) throw httpError(404, 'workspace not found');
+    const isOwner = wsSnap.data().ownerId === uid || wsRef.id === uid;
+    const isAdminMember = memberSnap.exists && memberSnap.data().role === 'admin';
+    if (!isOwner && !isAdminMember) throw httpError(403, 'not allowed to withdraw from this workspace');
+
+    const operator = String(body.operator || 'Unknown');
+    const withdrawalRef = wsRef.collection('withdrawals').doc(`op_${operationId}`);
+
+    const withdrawalId = await db.runTransaction(async (t) => {
+      const existing = await t.get(withdrawalRef);
+      if (existing.exists) return withdrawalRef.id;
+      const entries = await t.get(wsRef.collection('cash_entries'));
+      let balance = 0;
+      entries.forEach((doc) => {
+        const d = doc.data();
+        const amt = Number(d.amount || 0);
+        const type = d.type || 'income';
+        balance += ['income', 'revenue', 'encaissement'].includes(type) ? amt : -amt;
+      });
+      if (Math.round(balance) < amount) throw httpError(400, 'Insufficient workspace funds');
+
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      t.set(withdrawalRef, {
+        operationId,
+        requestedBy: uid,
+        operator,
+        account: String(body.destination_info),
+        amount,
+        fees: Math.max(0, Math.round(Number(body.fees) || 0)),
+        netPayout: Math.round(Number(body.netPayout) || amount),
+        status: 'pending',
+        createdAt: now,
+      });
+      t.set(wsRef.collection('cash_entries').doc(), {
+        type: 'expense',
+        title: `Retrait de Fonds (${operator})`,
+        amount,
+        withdrawalId: withdrawalRef.id,
+        createdAt: now,
+        createdBy: uid,
+      });
+      t.set(wsRef.collection('notifications').doc(), {
+        type: 'withdraw',
+        title: 'Demande de Retrait en cours',
+        message: `Votre demande de ${amount} FCFA via ${operator} est en traitement sous 24-48h.`,
+        createdAt: now,
+        isRead: false,
+      });
+      return withdrawalRef.id;
+    });
+
+    res.json({ success: true, withdrawalId });
+  } catch (e) {
+    if (!e.statusCode) console.error(e);
     res.status(e.statusCode || 500).json({ error: e.message });
   }
 });

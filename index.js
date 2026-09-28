@@ -965,6 +965,88 @@ function isValidOrder(order) {
   return true;
 }
 
+// ---------------------------
+// Sequestre des commandes (2026-09-28) -- porte depuis la Cloud Function
+// geniusPayWebhook (functions/index.js), jamais deployee.
+//
+// Commission = bareme des CGU (legal_documents.dart) : 10 % sans abonnement
+// actif, 5 % Mensuel, 4 % Trimestriel, 3 % Annuel, sur netProductAmount
+// (produits apres reductions, hors livraison). L'ancienne fonction comparait
+// stores.currentPlan a 'annual'/'mensuel' -- valeurs qui n'existent pas
+// (users.currentPlan vaut 'Mensuel', 'Trimestriel', 'Annuel'...) : tout
+// vendeur aurait paye 10 %.
+//
+// Le PIN n'est plus stocke sur la commande (orders.customerPin), lisible par
+// le vendeur ET le livreur assigne -- qui pouvaient donc liberer les fonds
+// sans jamais livrer. Il vit dans order_pins/{orderId}, lisible uniquement
+// par l'acheteur (firestore.rules).
+// ---------------------------
+function commissionRateForSeller(sellerData, nowMs = Date.now()) {
+  const expiry = sellerData?.subscriptionDate;
+  const active = sellerData?.isSubscribed === true &&
+    expiry && typeof expiry.toMillis === 'function' && expiry.toMillis() > nowMs;
+  if (!active) return { rate: 0.10, plan: 'none' };
+  const plan = String(sellerData.currentPlan || '');
+  if (plan.startsWith('Annuel')) return { rate: 0.03, plan };
+  if (plan.startsWith('Trimestriel')) return { rate: 0.04, plan };
+  if (plan.startsWith('Mensuel')) return { rate: 0.05, plan };
+  return { rate: 0.10, plan };
+}
+
+function buildEscrowForPaidOrder(orderId, orderData, sellerData, paidAmount) {
+  const paid = Math.round(Number(
+    paidAmount != null && Number.isFinite(Number(paidAmount))
+      ? paidAmount
+      : (orderData.expectedAmount ?? orderData.totalAmount ?? 0),
+  ));
+  const netProductAmount = Math.round(Number(orderData.netProductAmount || 0));
+  const deliveryFee = Math.round(Number(orderData.deliveryFee || 0));
+  const { rate, plan } = commissionRateForSeller(sellerData);
+
+  let commissionAmount = Math.round(netProductAmount * rate);
+  let sellerAmount = paid - commissionAmount;
+  if (sellerAmount < 0) {
+    console.warn(`⚠️ Commande ${orderId} : sellerAmount negatif, commission plafonnee`);
+    commissionAmount = paid;
+    sellerAmount = 0;
+  }
+
+  const pin = crypto.randomInt(100000, 1000000).toString();
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const escrowRef = db.collection('escrow').doc();
+
+  return {
+    escrowRef,
+    escrow: {
+      orderId,
+      storeId: orderData.storeId || null,
+      sellerId: orderData.sellerId || null,
+      customerId: orderData.buyerId || null,
+      totalAmount: paid,
+      productPrice: netProductAmount,
+      deliveryFee,
+      commissionAmount,
+      commissionRate: rate,
+      sellerAmount, // inclut la livraison, commission deduite
+      sellerSubscription: plan,
+      status: 'in_escrow',
+      failedPinAttempts: 0,
+      createdAt: now,
+      lastUpdated: now,
+    },
+    pinRef: db.collection('order_pins').doc(orderId),
+    pin: { buyerId: orderData.buyerId || null, pin, createdAt: now },
+    orderFields: {
+      escrowId: escrowRef.id,
+      escrowStatus: 'in_escrow',
+      sellerAmount,
+      commissionAmount,
+    },
+  };
+}
+
+const MAX_PIN_ATTEMPTS = 5;
+
 async function handleOrderWebhook(status, metadata, paidAmount) {
   const { orderId, buyerId, sellerId } = metadata;
   if (!orderId) {
@@ -1061,12 +1143,36 @@ async function handleOrderWebhook(status, metadata, paidAmount) {
         }
       }
 
+      // Sequestre + PIN de livraison a la confirmation du paiement
+      // (2026-09-28). Auparavant crees uniquement par la Cloud Function
+      // geniusPayWebhook, jamais deployee : aucune commande payee n'avait de
+      // sequestre ni de PIN, donc aucune ne pouvait etre livree ni le
+      // vendeur credite. Lecture du vendeur AVANT toute ecriture
+      // (contrainte des transactions Firestore).
+      let escrowWrites = null;
+      if (status === 'completed' && !orderData.escrowId) {
+        const sellerSnap = orderData.sellerId
+          ? await transaction.get(db.collection('users').doc(orderData.sellerId))
+          : null;
+        escrowWrites = buildEscrowForPaidOrder(
+          orderId,
+          orderData,
+          sellerSnap?.data(),
+          paidAmount,
+        );
+        Object.assign(newOrderData, escrowWrites.orderFields);
+      }
+
       const orderUpdatePayload = {
         ...newOrderData,
         lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
       };
-      
+
       transaction.update(orderRef, orderUpdatePayload);
+      if (escrowWrites) {
+        transaction.set(escrowWrites.escrowRef, escrowWrites.escrow);
+        transaction.set(escrowWrites.pinRef, escrowWrites.pin);
+      }
       if (chatRef && newValidOrdersCount !== null) {
         transaction.update(chatRef, { validOrdersCount: newValidOrdersCount });
       }
@@ -1448,113 +1554,105 @@ app.post('/campaign/confirm-free', async (req, res) => {
 });
 
 // ---------------------------
-// Liberation du sequestre par code PIN -- avant ce endpoint, le client
-// (escrow_service.dart) ecrivait directement escrow.status/orders.escrowStatus
-// dans Firestore, et la regle Firestore permettait a n'importe quelle partie
-// du sequestre (acheteur inclus) de le faire sans jamais entrer le bon PIN ni
-// meme avoir paye (audit du 2026-09-05). Le PIN et l'etat de paiement sont
-// desormais verifies ici, cote serveur, avant toute ecriture.
+// Liberation du sequestre par le PIN de l'acheteur (2026-09-28).
+// Remplace la Cloud Function releaseEscrow (jamais deployee : la validation
+// du PIN echouait en 404 en production) et l'ancienne version de ce
+// endpoint (inutilisee, pas de credit portefeuille). Une seule transaction :
+//   - PIN verifie contre order_pins/{orderId} (lisible par l'acheteur seul),
+//     5 essais maximum par sequestre (sinon 6 chiffres = force brute
+//     possible par le vendeur ou le livreur) ;
+//   - commande 'delivered', sequestre 'released', stock decremente ;
+//   - portefeuille vendeur (seller_wallet, lu par portefeuille_screen.dart)
+//     credite de escrow.sellerAmount + ecriture idempotente
+//     wallet_transactions/escrow:{id}:release ;
+//   - commission, compteur completedDeliveries du livreur, CA journalier.
+//
+// Corps : { orderId, pin } -- ou l'ancien { escrow_id, customer_pin }.
+// Reponse : { success: true } | { success: true, alreadyProcessed: true }
+//         | { success: false, attemptsLeft } | 423 si bloque.
 // ---------------------------
 app.post('/escrow/release', async (req, res) => {
   try {
     const decoded = await requireAuth(req);
     if (!db) return res.status(503).json({ error: 'firestore not configured' });
 
-    const { orderId, pin } = req.body || {};
+    const body = req.body || {};
+    let orderId = body.orderId;
+    const pin = String(body.pin ?? body.customer_pin ?? '').trim();
+    if (!orderId && body.escrow_id) {
+      const escrowSnap = await db.collection('escrow').doc(String(body.escrow_id)).get();
+      orderId = escrowSnap.data()?.orderId;
+    }
     if (!orderId || !pin) {
       return res.status(400).json({ error: 'orderId and pin required' });
     }
     const uid = decoded.uid;
-    const orderRef = db.collection('orders').doc(orderId);
+    const orderRef = db.collection('orders').doc(String(orderId));
 
-    // D'abord, rAcupA"rer de maniA"re non-transactionnelle le delivery_driver si nAcessaire
-    // car cela ne mute pas et Aavite de charger la transaction avec une lecture statique.
-    let fleetEntryUserId = null;
-    let didFetchFleet = false;
-    
-    // On rAalise la logique mAatier au sein de la transaction Firestore.
     const result = await db.runTransaction(async (t) => {
+      // ----------------- LECTURES -----------------
       const orderSnap = await t.get(orderRef);
-      if (!orderSnap.exists) {
-        throw new Error('ORDER_NOT_FOUND');
-      }
+      if (!orderSnap.exists) throw httpError(404, 'order not found');
       const order = orderSnap.data();
 
-      // Authorization
-      let isAuthorized =
-        order.sellerId === uid ||
-        order.livreurId === uid ||
-        order.driverId === uid;
+      const fleetId = order.assignedDriverId || order.livreurId || order.driverId;
+      const fleetSnap = fleetId
+        ? await t.get(db.collection('delivery_drivers').doc(String(fleetId)))
+        : null;
+      const driverUserId = fleetSnap?.exists ? fleetSnap.data().userId || null : null;
 
-      if (!isAuthorized && order.assignedDriverId) {
-        if (!didFetchFleet) {
-          const fleetEntrySnap = await db.collection('delivery_drivers').doc(order.assignedDriverId).get();
-          fleetEntryUserId = fleetEntrySnap.exists ? fleetEntrySnap.data().userId : null;
-          didFetchFleet = true;
-        }
-        isAuthorized = fleetEntryUserId === uid;
+      const isParty = uid === order.buyerId || uid === order.sellerId ||
+        (driverUserId != null && uid === driverUserId);
+      if (!isParty) throw httpError(403, 'not authorized for this order');
+
+      if (order.escrowStatus === 'released') return { alreadyProcessed: true };
+      if (order.escrowStatus !== 'in_escrow' || !order.escrowId) {
+        throw httpError(409, 'order not in escrow');
+      }
+      if (!PAID_ORDER_STATUSES.has(order.paymentStatus)) {
+        throw httpError(409, 'payment not confirmed');
       }
 
-      if (!isAuthorized) {
-        throw new Error('NOT_AUTHORIZED');
-      }
-
-      // Verrou MAatier & Idempotence
-      if (order.escrowStatus !== 'in_escrow') {
-        if (order.escrowStatus === 'released' || order.status === 'delivered') {
-          if (!order.customerPin || order.customerPin === pin) {
-             throw new Error('ALREADY_RELEASED');
-          }
-        }
-        throw new Error('NOT_IN_ESCROW');
-      }
-
-      const paidStatuses = ['pay_on_delivery', 'test_mode_paid', 'completed'];
-      if (!paidStatuses.includes(order.paymentStatus)) {
-        throw new Error('PAYMENT_NOT_CONFIRMED');
-      }
-
-      if (!order.customerPin || order.customerPin !== pin) {
-        throw new Error('INVALID_PIN');
-      }
-
-      const escrowId = order.escrowId;
-      if (!escrowId) {
-        throw new Error('NO_ESCROW');
-      }
-      const escrowRef = db.collection('escrow').doc(escrowId);
+      const escrowRef = db.collection('escrow').doc(order.escrowId);
       const escrowSnap = await t.get(escrowRef);
-      if (!escrowSnap.exists) {
-        throw new Error('ESCROW_NOT_FOUND');
-      }
+      if (!escrowSnap.exists) throw httpError(404, 'escrow document not found');
       const escrow = escrowSnap.data();
+      if (escrow.status === 'released') return { alreadyProcessed: true };
 
-      // RAcquisitionner les rAcfArences produits pour dAccrAcmenter le stock
-      const items = order.items || [];
-      const productRefs = [];
+      const attempts = Number(escrow.failedPinAttempts || 0);
+      if (attempts >= MAX_PIN_ATTEMPTS) throw httpError(423, 'too many wrong PIN attempts');
+
+      const pinSnap = await t.get(db.collection('order_pins').doc(orderRef.id));
+      const expectedPin = pinSnap.exists ? String(pinSnap.data().pin) : null;
+
+      if (!expectedPin || expectedPin !== pin) {
+        t.update(escrowRef, {
+          failedPinAttempts: attempts + 1,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return { invalidPin: true, attemptsLeft: Math.max(0, MAX_PIN_ATTEMPTS - attempts - 1) };
+      }
+
+      const items = Array.isArray(order.items) ? order.items : [];
       const productSnaps = [];
       for (const item of items) {
-        const productId = item.productId;
-        if (productId) {
-          const pRef = db.collection('products').doc(productId);
-          productRefs.push(pRef);
-          // On les lit dans la transaction pour Acviter les stock races
-          productSnaps.push(await t.get(pRef)); 
-        } else {
-          productRefs.push(null);
-          productSnaps.push(null);
-        }
+        productSnaps.push(item?.productId
+          ? await t.get(db.collection('products').doc(String(item.productId)))
+          : null);
       }
 
-      // ----------------- WRITES -----------------
-      const now = admin.firestore.FieldValue.serverTimestamp();
+      const sellerId = escrow.sellerId || order.sellerId;
+      const walletRef = db.collection('seller_wallet').doc(sellerId);
+      const ledgerRef = walletRef.collection('wallet_transactions').doc(`escrow:${escrowSnap.id}:release`);
+      const walletSnap = await t.get(walletRef);
+      const ledgerSnap = await t.get(ledgerRef);
+      const publicDriverSnap = driverUserId
+        ? await t.get(db.collection('public_drivers').doc(driverUserId))
+        : null;
 
-      // 1. Order + Escrow (Statuts finaux)
-      t.update(escrowRef, {
-        status: 'released',
-        pinValidatedAt: now,
-        releasedAt: now,
-      });
+      // ----------------- ECRITURES -----------------
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      t.update(escrowRef, { status: 'released', pinValidatedAt: now, releasedAt: now, releasedBy: uid, lastUpdated: now });
       t.update(orderRef, {
         escrowStatus: 'released',
         status: 'delivered',
@@ -1563,112 +1661,84 @@ app.post('/escrow/release', async (req, res) => {
         lastUpdated: now,
       });
 
-      // 2. Stock dAduction
-      const sellerId = order.sellerId || order.storeId;
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        const pRef = productRefs[i];
-        const pSnap = productSnaps[i];
-        
-        if (!pRef || !pSnap.exists) continue;
-        
-        const orderedQty = Number(item.quantity) || 0;
-        if (orderedQty <= 0) continue;
-
-        const data = pSnap.data();
-        const freshQty = Number(data.quantity) || 0;
-        // RAcgle mActier stricte: le stock comptable ne doit jamais Aatre nAcgatif.
-        const newQty = Math.max(0, freshQty - orderedQty);
-
-        t.update(pRef, {
-          quantity: newQty,
-          lastUpdated: now,
-        });
-
-        // 3. Stock History
-        const stockHistoryId = `${orderId}_${item.productId}`;
-        t.set(db.collection('stock_history').doc(stockHistoryId), {
+      // Stock (jamais negatif) + historique
+      items.forEach((item, i) => {
+        const snap = productSnaps[i];
+        const qty = Number(item?.quantity) || 0;
+        if (!snap || !snap.exists || qty <= 0) return;
+        const freshQty = Number(snap.data().quantity) || 0;
+        const newQty = Math.max(0, freshQty - qty);
+        t.update(snap.ref, { quantity: newQty, lastUpdated: now });
+        t.set(db.collection('stock_history').doc(`${orderRef.id}_${item.productId}`), {
           productId: item.productId,
-          change: -orderedQty,
+          change: -qty,
           previousQty: freshQty,
-          newQty: newQty,
+          newQty,
           timestamp: now,
           userId: sellerId,
-          type: 'sale'
-        });
-      }
-
-      // 4. Finances : Mouvements financiers sAcurisAcs (Seller, Driver, Commission)
-      const sellerAmount = Number(escrow.sellerAmount) || 0;
-      const driverAmount = Number(escrow.driverAmount) || 0;
-      const commissionAmount = Number(escrow.commissionAmount) || 0;
-      const finalDriverId = order.assignedDriverId || order.driverId || order.livreurId;
-
-      if (sellerId && sellerAmount > 0) {
-        t.set(db.collection('transactions').doc(`${escrowId}_seller`), {
-          userId: sellerId,
           type: 'sale',
-          amount: sellerAmount,
-          orderId: orderId,
-          escrowId: escrowId,
+        });
+      });
+
+      // Portefeuille vendeur (idempotent via l'ecriture de ledger)
+      const amount = Math.max(0, Math.round(Number(escrow.sellerAmount) || 0));
+      if (!ledgerSnap.exists) {
+        const balance = Math.round(Number(walletSnap.data()?.balance || 0)) + amount;
+        if (walletSnap.exists) {
+          t.update(walletRef, { balance, updatedAt: now });
+        } else {
+          t.set(walletRef, { sellerId, balance, currency: 'XOF', status: 'active', createdAt: now, updatedAt: now });
+        }
+        t.set(ledgerRef, {
+          idempotencyKey: ledgerRef.id,
+          type: 'escrow_release',
+          amount,
+          reference: escrowSnap.id,
+          orderId: orderRef.id,
           status: 'completed',
-          description: 'Vente sAccurisAce (fonds dAcbloquAcs par code PIN)',
+          actor: uid,
           createdAt: now,
         });
       }
 
-      if (finalDriverId && driverAmount > 0) {
-        t.set(db.collection('transactions').doc(`${escrowId}_driver`), {
-          userId: finalDriverId,
-          type: 'delivery',
-          amount: driverAmount,
-          orderId: orderId,
-          escrowId: escrowId,
-          status: 'completed',
-          description: 'Frais de livraison (sAcquestre)',
-          createdAt: now,
-        });
-      }
-
+      const commissionAmount = Math.round(Number(escrow.commissionAmount) || 0);
       if (commissionAmount > 0) {
-        t.set(db.collection('commissions').doc(`${escrowId}_commission`), {
-          orderId: orderId,
-          escrowId: escrowId,
+        t.set(db.collection('commissions').doc(`${escrowSnap.id}_commission`), {
+          orderId: orderRef.id,
+          escrowId: escrowSnap.id,
           amount: commissionAmount,
-          sellerId: sellerId,
-          sellerSubscription: escrow.sellerSubscription || 'mensuel',
+          rate: escrow.commissionRate ?? null,
+          sellerId,
+          sellerSubscription: escrow.sellerSubscription || null,
           status: 'earned',
           createdAt: now,
         });
       }
 
-      // Note : L'Aapargne automatique (VaultService) et la progression (Ascension/GradeService)
-      // ne sont pas inclus ici car cela obligerait A des query() complexes et nAcessiterait 
-      // de dupliquer toute la logique Flutter en Node.js (ex: boucle sur 5 niveaux d'Ascension). 
-      // Ces effets secondaires "non-financiers stricts" (ou gamification) 
-      // devraient faire l'objet de Cloud Functions distinctes ou Aatre migracs plus tard.
+      if (publicDriverSnap?.exists) {
+        t.update(publicDriverSnap.ref, { completedDeliveries: admin.firestore.FieldValue.increment(1) });
+      }
 
-      return { success: true };
+      const storeId = escrow.storeId || order.storeId;
+      if (storeId) {
+        const dateStr = new Date().toISOString().split('T')[0];
+        t.set(db.collection('store_stats').doc(storeId).collection('daily_revenue').doc(dateStr), {
+          revenue: admin.firestore.FieldValue.increment(amount),
+          releasedOrders: admin.firestore.FieldValue.increment(1),
+          sellerId,
+          updatedAt: now,
+        }, { merge: true });
+      }
+
+      return { released: true };
     });
 
-    res.json(result);
-
+    if (result.alreadyProcessed) return res.json({ success: true, alreadyProcessed: true });
+    if (result.invalidPin) return res.json({ success: false, attemptsLeft: result.attemptsLeft });
+    res.json({ success: true });
   } catch (e) {
-    if (e.message === 'ALREADY_RELEASED') {
-       return res.json({ success: true, alreadyProcessed: true });
-    }
-    if (e.message === 'INVALID_PIN') {
-       return res.json({ success: false });
-    }
-    if (e.message === 'ORDER_NOT_FOUND') return res.status(404).json({ error: 'order not found' });
-    if (e.message === 'NOT_AUTHORIZED') return res.status(403).json({ error: 'not authorized for this order' });
-    if (e.message === 'NOT_IN_ESCROW') return res.status(409).json({ error: 'order not in escrow' });
-    if (e.message === 'PAYMENT_NOT_CONFIRMED') return res.status(409).json({ error: 'payment not confirmed' });
-    if (e.message === 'NO_ESCROW') return res.status(409).json({ error: 'escrow not found for this order' });
-    if (e.message === 'ESCROW_NOT_FOUND') return res.status(404).json({ error: 'escrow document not found' });
-
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    if (!e.statusCode) console.error(e);
+    res.status(e.statusCode || 500).json({ error: e.message });
   }
 });
 
